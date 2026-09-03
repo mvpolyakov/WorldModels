@@ -10,6 +10,7 @@
 
 import genesis as gs
 import argparse
+import os
 
 from sim.build_world import build_world
 from sim.scene_config import load_scene_config
@@ -19,9 +20,11 @@ def get_args():
     parser = argparse.ArgumentParser(description="Build and run GRI eval.")
     parser.add_argument("-n", "--n-envs", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--ghost-interval", type=int, default=10)
+    parser.add_argument("--output-image", type=str, default="artifacts/ball_path.png")
 
-    # load available options and show here on demand
     parser.add_argument("--scene-config", type=str, default='base')
+
     #    parser.add_argument("--model", type=str, default="")
     # later also add randomization options - with seed
 
@@ -36,14 +39,26 @@ def main() -> None:
 
     scene_config = load_scene_config(args.scene_config)
 
-    world = build_world(scene_config, n_envs=args.n_envs)
+    
+    ghost_count = (args.steps + args.ghost_interval - 1) // args.ghost_interval
+    world, trajectory_recorder = build_world(
+        scene_config,
+        n_envs=args.n_envs,
+        ghost_count=ghost_count,
+    )
 
     add_scene_controls(world)
 
     # load model if any
 
-    for _ in range(args.steps):
+    for step in range(args.steps):
         world.step()
+        if trajectory_recorder is not None and (step + 1) % args.ghost_interval == 0:
+            trajectory_recorder.capture()
+
+    if trajectory_recorder is not None:
+        output_path = trajectory_recorder.save_image(args.output_image)
+        print(f"Saved ball path image to {os.path.abspath(output_path)}")
 
     # save frames ??
 

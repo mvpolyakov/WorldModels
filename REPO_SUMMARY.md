@@ -52,7 +52,9 @@ This is an early Genesis-based scene/simulation prototype. It currently builds a
 
 - CLI options: `--n-envs` (default `1`), `--steps` (default `1000`), and `--scene-config` (default `base`).
 - Initializes Genesis with the GPU backend, loads the scene config, builds the world, registers reset controls, performs initial steps, then keeps the viewer alive in an infinite stepping loop.
-- Model loading, rollout collection, and frame saving are not implemented yet.
+- Model loading and rollout collection are not implemented yet.
+- The evaluation loop can pre-create translucent, non-colliding ball ghosts, place one every `--ghost-interval` steps, and save an image using the live viewer camera pose with `--output-image` (default `artifacts/ball_path.png`).
+- `TrajectoryRecorder` owns the ghost entities, capture state, render camera, and image export; `World` only exposes it as an optional `trajectory_recorder` member.
 
 ### `src/editor.py`
 

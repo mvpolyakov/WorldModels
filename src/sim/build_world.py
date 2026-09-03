@@ -5,10 +5,13 @@ Iterates over config.landscape and config.mobiles to add entities
 to the scene generically. Each ObjectConfig specifies a morph_type
 string that maps to a gs.morphs class (Box, Sphere, Mesh, etc.).
 """
+from typing import Optional
+
 import genesis as gs
 
 from .dataclasses import World
 from .scene_config import SceneConfig, ObjectConfig
+from .utilities.sim_utils import TrajectoryRecorder
 
 
 # Supported morph types mapped to their gs.morphs class
@@ -50,12 +53,17 @@ def _add_object(scene, obj: ObjectConfig):
     )
 
 
-def build_world(config: SceneConfig, n_envs: int = 1) -> World:
+def build_world(
+    config: SceneConfig,
+    n_envs: int = 1,
+    ghost_count: int = 0,
+) -> tuple[World, Optional[TrajectoryRecorder]]:
     """Build a World from a SceneConfig.
 
     Args:
         config: Scene parameters (landscape, mobiles, cameras).
         n_envs: Number of parallel environment copies.
+        ghost_count: Number of translucent ball snapshots to pre-create.
 
     Returns:
         A fully built World instance ready for stepping.
@@ -105,9 +113,27 @@ def build_world(config: SceneConfig, n_envs: int = 1) -> World:
         fov=config.camera.obs_fov,
     )
 
+    trackable_obj_name = "ball"
+    ball = next((obj for obj in config.mobiles if obj.name == trackable_obj_name), None)
+    trajectory_recorder = None
+
+    if ghost_count:
+        if ball is None:
+            raise Exception('config problem: trajectory recorded expected a ' \
+                            '"ball" object but none found')
+
+        trajectory_recorder = TrajectoryRecorder(
+            scene=scene,
+            camera=obs_cam,
+            mobile=mobile_entities[trackable_obj_name],
+            mobile_config=ball,
+            ghost_count=ghost_count,
+        )
+
     scene.build(n_envs=n_envs, env_spacing=(1.5, 1.5))
 
     return World(
-        scene=scene,
-        mobiles=mobile_entities,
-    )
+            scene=scene,
+            mobiles=mobile_entities,
+            ), trajectory_recorder
+    

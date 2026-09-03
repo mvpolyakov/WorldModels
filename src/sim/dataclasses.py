@@ -24,7 +24,6 @@ class World:
 #        return self.scene.get_observations()
     
     def reset(self, randomize=False):
-        print('RESETTING\n\n\n')
         self.scene.reset()
 
         if randomize:

@@ -5,3 +5,4 @@ rsl-rl-lib==5.5.0
 pyuipc==0.0.27
 huggingface_hub==1.29.0
 imgui>=2.0
+Pillow>=10.0
