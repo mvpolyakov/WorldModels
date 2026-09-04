@@ -5,43 +5,63 @@ from PIL import Image
 import genesis as gs
 
 
-class DummyWorldModel:
-    """Generate a small random-walk prediction from an initial position."""
-
-    def __init__(self, seed=0, offset_scale=0.03):
-        self._random = np.random.default_rng(seed)
-        self.offset_scale = offset_scale
-
-    def predict(self, current_state: list):
-        """
-        Takes the current world state (for now a list of object positions)
-        and returns the updated state 
-        """
-        new_state = []
-        for obj_state in current_state:
-            start = np.asarray(obj_state, dtype=float)
-            offset = self._random.normal(0.0, self.offset_scale, size=2)
-            new_state.append(start + np.array((offset[0], offset[1], 0.0)))
-
-        return new_state
-    
 class PredictionWorld:
     """Prediction-only world containing mobile state and a world model."""
 
-    def __init__(self, mobile_configs, model, lateral_offset=(0.0, 1.0, 0.0)):
-        offsets = np.asarray(lateral_offset, dtype=float)
+    def __init__(self, mobile_configs, model, n_envs=1):
         self.model = model
-        self.mobile_positions = []
-        for config in mobile_configs:
-            position = np.asarray(config.morph_params["pos"], dtype=float)
-            self.mobile_positions.append(position + offsets)
+        # list of 3d positions (1 per object)
+        initial_positions = [
+            np.asarray(config.morph_params["pos"], dtype=float)
+            for config in mobile_configs
+        ]
+        # create 3d tensor: Bxkx3 with k=# of mobiles
+        self.mobile_positions = np.repeat(
+            np.asarray(initial_positions)[None, :, :],
+            n_envs,
+            axis=0,
+        )
 
     def step(self):
-        """Advance each predicted mobile by one model step."""
+        """Advance each predicted mobile by one model step.
+
+        ``mobile_positions`` is a (B, K, 3) array containing all environments
+        and mobiles, and the model receives that array directly.
+        """
         predicted_positions = self.model.predict(self.mobile_positions)
-        # so that trajectory capture which keeps track of *the positions* 
-        # (not the world object) stays abreast of things
-        self.mobile_positions[:] = predicted_positions
+        self.mobile_positions[...] = predicted_positions
+
+
+class DisplacementErrorTracker:
+    """Track summed planar displacement error across simulation steps."""
+
+    def __init__(self):
+        self.values = []
+        self._total_step_error = 0.0
+
+    def update(
+        self,
+        actual_positions: np.ndarray,
+        predicted_positions: np.ndarray,
+    ) -> float:
+        """Record and return cumulative displacement error.
+
+        Both position arrays have shape (B, K, 3): B environments, K
+        mobiles, and XYZ coordinates.
+        Each mobile contributes one mean error across environments. The
+        current step's errors are averaged across mobiles and added to the
+        running total without averaging across simulation steps.
+        """
+        if actual_positions.shape != predicted_positions.shape:
+            raise ValueError("Actual and predicted position shapes must match.")
+
+        displacement = actual_positions[..., :2] - predicted_positions[..., :2]
+        mobile_errors = np.linalg.norm(displacement, axis=-1).mean(axis=0)
+
+        step_error = float(np.mean(mobile_errors))
+        self._total_step_error += step_error
+        self.values.append(self._total_step_error)
+        return self._total_step_error
 
 
 def correct_camera_rotation_direction(viewer):
@@ -100,6 +120,7 @@ class TrajectoryRecorder:
         actual_mobile_configs,
         predicted_mobile_configs,
         ghost_count,
+        prediction_lateral_offset=(0.0, .5, 0.0),
     ):
         self.scene = scene
         self.actual_mobiles = actual_mobiles
@@ -107,6 +128,7 @@ class TrajectoryRecorder:
         self.actual_mobile_configs = {config.name: config for config in actual_mobile_configs}
         self.predicted_mobile_configs = {config.name: config for config in predicted_mobile_configs}
         self.predicted_mobile_names = [config.name for config in predicted_mobile_configs]
+        self.prediction_lateral_offset = np.asarray(prediction_lateral_offset, dtype=float)
         self.ghost_count = ghost_count
         self._next_ghost = 0
         self.ghosts = self._add_hidden_group((0.2, 0.6, 1.0, 0.28), 
@@ -122,7 +144,9 @@ class TrajectoryRecorder:
         self.predicted_mobiles = predicted_mobiles
 
     def capture(self):
-        """Place one ghost for every actual and predicted mobile."""
+        """Place one ghost for every actual and predicted mobile.
+            Supports batching across envs
+        """
         if self._next_ghost >= self.ghost_count:
             return False
         if not hasattr(self, "predicted_mobiles"):
@@ -130,8 +154,12 @@ class TrajectoryRecorder:
 
         for name, mobile in self.actual_mobiles.items():
             self.ghosts[name][self._next_ghost].set_pos(mobile.get_pos())
-        for name, position in zip(self.predicted_mobile_names, self.predicted_mobiles):
-            self.prediction_ghosts[name][self._next_ghost].set_pos(position)
+
+        for index, name in enumerate(self.predicted_mobile_names):
+            position = self.predicted_mobiles[:, index, :]
+            self.prediction_ghosts[name][self._next_ghost].set_pos(
+                position + self.prediction_lateral_offset
+            )
 
         self._next_ghost += 1
         return True

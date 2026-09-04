@@ -13,6 +13,7 @@
 
 ## User Code-Structure Preferences
 
+- Make only changes that pertain to the requested task. Do not reformat existing code for cosmetic reasons, such as changing one line to multiple lines or vice versa; be parsimonious with edits.
 - Prefer clear, semantic names that communicate an object's role and distinguish related concepts. For example, use names such as `TrajectoryRecorder`, `mobile`, and `mobile_config` instead of ambiguous names like `data` or `obj` when the distinction matters.
 - Encapsulate behavior according to its domain meaning. For example: keep `World` focused on simulation orchestration and core world state; put trajectory capture, ghost lifecycle, capture indexing, and image export in a dedicated `TrajectoryRecorder`.
 - Prefer explicit delegation over growing a central object with unrelated responsibilities. A domain service may be attached to `World` for access, but it should own its own state and behavior.

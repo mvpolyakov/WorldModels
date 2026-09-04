@@ -53,7 +53,7 @@ def _add_object(scene, obj: ObjectConfig):
             friction_rolling=obj.friction_rolling,
             rho=obj.rho,
         ),
-        surface=gs.surfaces.Default(**surface_kwargs),
+        surface=gs.surfaces.Default(**surface_kwargs), # pyright: ignore[reportArgumentType]
     )
 
 
@@ -138,7 +138,7 @@ def build_world(
             ghost_count=ghost_count,
         )
 
-    scene.build(n_envs=n_envs, env_spacing=(1.5, 1.5))
+    scene.build(n_envs=n_envs, env_spacing=(2, 2))
 
     if config.show_viewer:
         correct_camera_rotation_direction(scene.viewer)
