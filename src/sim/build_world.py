@@ -11,7 +11,11 @@ import genesis as gs
 
 from .dataclasses import World
 from .scene_config import SceneConfig, ObjectConfig
-from .utilities.sim_utils import TrajectoryRecorder
+from .utilities.sim_utils import (
+    correct_camera_rotation_direction,
+    PredictionWorld,
+    TrajectoryRecorder,
+)
 
 
 # Supported morph types mapped to their gs.morphs class
@@ -110,30 +114,34 @@ def build_world(
         res=config.camera.obs_res,
         pos=config.camera.obs_pos,
         lookat=config.camera.obs_lookat,
-        fov=config.camera.obs_fov,
+        # Genesis accepts float FOVs, but its untyped integer default causes
+        # Pylance to infer this parameter as int.
+        fov=config.camera.obs_fov,  # pyright: ignore[reportArgumentType]
     )
 
     trackable_obj_name = "ball"
     ball = next((obj for obj in config.mobiles if obj.name == trackable_obj_name), None)
     trajectory_recorder = None
+    world = World(scene=scene, mobiles=mobile_entities)
 
     if ghost_count:
         if ball is None:
             raise Exception('config problem: trajectory recorded expected a ' \
-                            '"ball" object but none found')
+                            '"ball" object but it is missing')
 
         trajectory_recorder = TrajectoryRecorder(
             scene=scene,
             camera=obs_cam,
-            mobile=mobile_entities[trackable_obj_name],
-            mobile_config=ball,
+            actual_mobiles=mobile_entities,
+            actual_mobile_configs=config.mobiles,
+            predicted_mobile_configs=config.mobiles,
             ghost_count=ghost_count,
         )
 
     scene.build(n_envs=n_envs, env_spacing=(1.5, 1.5))
 
-    return World(
-            scene=scene,
-            mobiles=mobile_entities,
-            ), trajectory_recorder
+    if config.show_viewer:
+        correct_camera_rotation_direction(scene.viewer)
+
+    return world, trajectory_recorder
     

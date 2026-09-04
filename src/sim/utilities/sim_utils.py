@@ -28,7 +28,7 @@ class DummyWorldModel:
 class PredictionWorld:
     """Prediction-only world containing mobile state and a world model."""
 
-    def __init__(self, mobile_configs, model, lateral_offset=(0.0, 1.5, 0.0)):
+    def __init__(self, mobile_configs, model, lateral_offset=(0.0, 1.0, 0.0)):
         offsets = np.asarray(lateral_offset, dtype=float)
         self.model = model
         self.mobile_positions = []

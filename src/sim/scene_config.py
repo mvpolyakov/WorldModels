@@ -103,7 +103,7 @@ def _base_config() -> SceneConfig:
                 morph_params=dict(
                     pos=(0.0, 0.0, centre_z),
                     euler=(0.0, -angle_deg, 0.0),
-                    size=(ramp_length, 1.0, ramp_thickness),
+                    size=(ramp_length, 2.5, ramp_thickness),
                     fixed=True,
                 ),
                 friction=0.4,
