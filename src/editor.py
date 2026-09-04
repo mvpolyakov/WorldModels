@@ -19,7 +19,7 @@ class SceneEditor:
             if 'fixed' not in obj.morph_params:
                 obj.morph_params['fixed'] = True
 
-        self.world = build_world(self.config, n_envs=1)
+        self.world, _ = build_world(self.config, n_envs=1)
         
         self.entities = []
         self.original_poses = {} # {name: (pos, quat)}

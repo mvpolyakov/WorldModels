@@ -54,7 +54,9 @@ This is an early Genesis-based scene/simulation prototype. It currently builds a
 - Initializes Genesis with the GPU backend, loads the scene config, builds the world, registers reset controls, performs initial steps, then keeps the viewer alive in an infinite stepping loop.
 - Model loading and rollout collection are not implemented yet.
 - The evaluation loop can pre-create translucent, non-colliding ball ghosts, place one every `--ghost-interval` steps, and save an image using the live viewer camera pose with `--output-image` (default `artifacts/ball_path.png`).
-- `TrajectoryRecorder` owns the ghost entities, capture state, render camera, and image export; `World` only exposes it as an optional `trajectory_recorder` member.
+- `TrajectoryRecorder` owns the ghost entities, capture state, render camera, and image export; `build_world()` returns it separately from the physical `World`.
+- `PredictionWorld` is a lightweight mobile-only copy driven by a model; it stores a list of mobile positions and replaces each position with `model.predict(position)` during `step()`. The eval loop steps it alongside the physical `World`. `TrajectoryRecorder.capture()` records both worlds in the same call. `DummyWorldModel` currently supplies a small seeded random-walk forecast.
+- `PredictionWorld.step()` updates its mobile-position list in place so the recorder's reference remains live. Viewer camera rotation direction is corrected on both axes by wrapping the Genesis trackball class's rotate-mode drag method; pan and zoom retain Genesis's native behavior.
 
 ### `src/editor.py`
 

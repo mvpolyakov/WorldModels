@@ -15,6 +15,7 @@ import os
 from sim.build_world import build_world
 from sim.scene_config import load_scene_config
 from sim.dataclasses import add_scene_controls
+from sim.utilities.sim_utils import DummyWorldModel, PredictionWorld
 
 def get_args():
     parser = argparse.ArgumentParser(description="Build and run GRI eval.")
@@ -39,7 +40,7 @@ def main() -> None:
 
     scene_config = load_scene_config(args.scene_config)
 
-    
+
     ghost_count = (args.steps + args.ghost_interval - 1) // args.ghost_interval
     world, trajectory_recorder = build_world(
         scene_config,
@@ -50,9 +51,17 @@ def main() -> None:
     add_scene_controls(world)
 
     # load model if any
+    model = DummyWorldModel()
+
+    predicted_world = PredictionWorld(scene_config.mobiles, model)
+
+    if trajectory_recorder is not None:
+        trajectory_recorder.set_up_predictions(predicted_world.mobile_positions)
 
     for step in range(args.steps):
         world.step()
+        if predicted_world is not None:
+            predicted_world.step()
         if trajectory_recorder is not None and (step + 1) % args.ghost_interval == 0:
             trajectory_recorder.capture()
 
