@@ -1,93 +1,69 @@
-# GRI Repository Handoff Summary
+# GRI Repository Handoff
 
-## Repository state
+## Purpose
 
-- Working directory: `/home/mvp/git/gri`
-- Git has no commits yet; the project files currently appear as untracked files.
-- No test files or test configuration are present.
-- Python dependencies are listed in `requirements.txt`, including `genesis-world[render]==1.3.3`, PyTorch, NumPy, SciPy (implicitly used by the code), and RL-related packages.
+GRI is an early, configuration-driven Python prototype built on Genesis. It provides an interactive scene editor and a command-line evaluation loop for simulated worlds.
 
-## Project purpose
+The long-term goal is an object-centric world model that infers latent physical properties from observations and interventions, predicts outcomes in unseen scenarios, and eventually supports goal-directed action selection and generation. The repo currently contains simulation code, a basic evaluation script, and a dummy world model; training code is the next implementation step. The roadmap below describes planned work.
 
-This is an early Genesis-based scene/simulation prototype. It currently builds a configurable ramp-and-ball scene, runs it in an evaluation loop, and provides a keyboard-driven editor for interactively adjusting object poses and the viewer camera.
+## Research goals
 
-## Main files and flow
+1. **Infer and predict object physics.** Learn representations of motion and latent properties such as mass, friction, and restitution. Use interactions to infer properties (for example, mass), then predict their effects in other interactions. Longer-term predictions include object presence and motion under occlusion, and changes of state such as ice melting. Success means accurate predictions in unseen scenarios, including unseen combinations of properties.
+2. **Predict counterfactual outcomes.** Given the same state and different supplied actions, imagine the resulting trajectories. Begin with simple actions that do not require a trained action generator.
+3. **Generate purposeful actions.** For a target-reaching task such as hitting a ping-pong ball at a target, generate candidate paddle angles and velocities, evaluate their outcomes with the world model, and execute the selected action in simulation. First establish action selection over a grid, then learn to generate candidates.
 
-### `src/sim/scene_config.py`
+## Planned architecture and training approach
 
-- Defines `ObjectConfig`, `CameraConfig`, and `SceneConfig` dataclasses.
-- `SceneConfig.from_json()` loads `landscape`, `mobiles`, camera settings, gravity, and `show_viewer` from JSON.
-- `SceneConfig.to_json()` serializes dataclasses with `dataclasses.asdict()`.
-- `load_scene_config(key)` first treats an existing `.json` path as a file, then checks `src/sim/configs/<key>.json`, then falls back to the in-code `_base_config()` generator.
-- The generated fallback scene computes a 25-degree ramp and a ball placement mathematically. The checked-in JSON is a separate, edited 15-degree scene.
+The initial learned pipeline is **object encoder → dynamics model → decoder**. The encoder forms object-centric latent states from observations; the dynamics model predicts `s_t → s_{t+1}`; the decoder extracts predicted observable quantities and object properties, such as velocity.
 
-### `src/sim/configs/base.json`
+To validate the dynamics design, initially bypass the encoder and provide ground-truth simulator observations. Phase 1.0 uses only five consecutive XYZ positions to predict the next position with a small MLP; overfitting is acceptable while establishing the Genesis collection, training, and evaluation loop. Phase 1.1 will investigate persistent object state and inference of physical properties. Once dynamics works, replace simulator observations with a trained encoder. This bootstrap stage can be skipped in later runs after the design is validated.
 
-- Current file-backed scene configuration.
-- Contains one fixed `Box` ramp and one mobile `Sphere` ball.
-- The ramp is positioned around `(0.1, 0.2, 0.4476)` with Euler rotation near `(0, -15, 0)` degrees.
-- The ball is positioned around `(-0.2563, 0.05, 0.5802)` with radius `0.2`.
-- Viewer camera values have been saved from an editor session; observation camera values remain defaults.
-- Friction values are `0.5` for the ramp and `2.9` for the ball.
+See [TRAINING_PLAN.md](TRAINING_PLAN.md) for the detailed phase 1.0 implementation plan and phase 1.1 follow-up.
 
-### `src/sim/build_world.py`
+The rolling, bouncing, paddle-contact, and multi-object stages should share the same architecture, potentially with richer object states or greater capacity. Counterfactual action experiments then add explicit action conditioning to the dynamics model, `(s_t, a_t) → s_{t+1}`. Learned action generation is a separate, later module.
 
-- Maps config strings `Box`, `Sphere`, `Mesh`, `URDF`, and `MJCF` to Genesis morph classes.
-- Adds all landscape objects—including the second, ground `Box` component—then mobile objects. The ground is an ordinary landscape entry so its contact friction is configurable.
-- Passes each object's `morph_params` directly as keyword arguments to the selected Genesis morph constructor.
-- Applies sliding, torsional, and rolling friction from each object config. Rolling friction is enabled in the rigid solver so rolling bodies can lose energy and come to rest.
-- Supports optional per-object diffuse textures.
-- Adds a non-colliding Genesis checkerboard plane slightly above the configured ground box for visual context; the box remains the physics surface.
-- Adds an observation camera, builds the scene with `n_envs` and `env_spacing=(1.5, 1.5)`, and returns a `World` dataclass-like bundle.
-- Mobile entities are returned in a name-to-entity dictionary. Landscape entities are not stored in `World`; the editor relies on their creation order in `scene.entities`.
+## Phased roadmap
 
-### `src/sim/dataclasses.py`
+| Stage | Environment / task | Main learning or evaluation objective |
+| --- | --- | --- |
+| 1 | Ball rolling | Velocity and friction. Start dynamics training with ground-truth inputs. |
+| 2 | Ball bouncing | Velocity, restitution, and surface properties. |
+| 3 | Paddle hitting | Contact dynamics, spin, and effects of paddle angle and impact velocity. |
+| 3B | Multiple balls colliding | Track multiple objects and model their interactions. |
+| Transfer check | Real videos, before adding action conditioning | Evaluate whether learned representations capture real-world physical properties such as friction. |
+| 4 | Counterfactual hitting | From the same state, predict distinct ball trajectories for several supplied actions. |
+| 4A | Planning over an action grid | Use predicted outcomes to choose the paddle action that reaches target `T`; verify in simulation. |
+| 5 | Learned action generation | Train an action model to propose paddle angle/velocity candidates, score them with world-model rollouts, and execute the best candidate. |
 
-- Contains `World`, which wraps a Genesis scene, mobile entities, and an optional agent.
-- `World.step()` steps the scene and optional agent.
-- `World.reset()` resets the scene; randomization is currently a placeholder.
-- `add_scene_controls()` registers `T` for reset and Shift+`T` for randomized reset.
+Evaluation should distinguish prediction on held-out scenarios and property combinations, counterfactual rollout accuracy, and target-reaching success in simulation. Occlusion and material state changes remain longer-term goals beyond the initial ball-interaction curriculum.
 
-### `src/eval.py`
+## Architecture
 
-- CLI options: `--n-envs` (default `1`), `--steps` (default `1000`), and `--scene-config` (default `base`).
-- Initializes Genesis with the GPU backend, loads the scene config, builds the world, registers reset controls, performs initial steps, then keeps the viewer alive in an infinite stepping loop.
-- Model loading and rollout collection are not implemented yet.
-- The evaluation loop can pre-create translucent, non-colliding ball ghosts, place one every `--ghost-interval` steps, and save an image using the live viewer camera pose with `--output-image` (default `artifacts/ball_path.png`).
-- `TrajectoryRecorder` owns the ghost entities, capture state, render camera, and image export; `build_world()` returns it separately from the physical `World`.
-- `PredictionWorld` is a lightweight mobile-only copy driven by a model; it stores a list of mobile positions and replaces each position with `model.predict(position)` during `step()`. The eval loop steps it alongside the physical `World`. `TrajectoryRecorder.capture()` records both worlds in the same call. `DummyWorldModel` currently supplies a small seeded random-walk forecast.
-- `PredictionWorld.step()` updates its mobile-position list in place so the recorder's reference remains live. Viewer camera rotation direction is corrected on both axes by wrapping the Genesis trackball class's rotate-mode drag method; pan and zoom retain Genesis's native behavior.
+- `src/sim/scene_config.py` defines scene dataclasses and loads configuration. An existing JSON path is checked first, then `src/sim/configs/<key>.json`, then the in-code fallback configuration.
+- `src/sim/build_world.py` converts configuration objects into Genesis entities and assembles the scene. It returns the physical `World` plus optional visualization services.
+- `src/sim/dataclasses.py` contains the `World` wrapper and viewer controls.
+- `src/eval.py` is the rollout/evaluation entry point.
+- `src/editor.py` is the interactive scene editor and config saver.
+- `src/world_models/` contains model implementations. The model interface currently accepts and returns position arrays shaped `(B, K, 3)`: environments, mobiles, XYZ coordinates.
+- `src/sim/utilities/` contains simulation support and visualization helpers. Visualization logic should remain separate from world construction and physics state.
 
-### `src/editor.py`
+## Development conventions
 
-- CLI option: `--config`, defaulting to `src/sim/configs/base.json`.
-- Initializes Genesis with the GPU backend and loads the specified config.
-- Ensures objects without an existing `fixed` morph parameter are fixed while editing, so gravity does not move them.
-- Selects landscape objects by their creation order, with the ramp first and ground second; mobiles come from `world.mobiles`.
-- `TAB` cycles selection; `I/K`, `J/L`, and `U/O` translate on X/Y/Z; number keys `1/3`, `4/6`, and `7/9` rotate around X/Y/Z; `R` resets the selected object to its initial pose; `ENTER` saves.
-- Saving writes current positions and either Euler angles or quaternions back into each object's `morph_params`, removes temporary `fixed` only from mobile objects, saves viewer camera position/look-at, and calls `SceneConfig.to_json()`.
+- Keep scene data and physical/visual properties in the config model or JSON files.
+- Use semantic names and domain-focused encapsulation.
+- Represent scene components uniformly in their appropriate config lists.
+- Make only task-related edits; avoid cosmetic reformatting.
+- Genesis APIs and typings are version-sensitive. Verify installed source or signatures before changing Genesis calls.
 
-## Current scene-configuration concerns for the next task
+## Validation and execution
 
-1. `base.json` is now authoritative whenever it exists, so edits to `_base_config()` are ignored by the default loader.
-2. The second `landscape` component is an explicit fixed ground `Box`, represented like the ramp, so its sliding and rolling friction can be tuned independently in `base.json`.
-3. `friction` controls sliding resistance. For a rolling sphere, tune `friction_rolling` (in metres) because rolling resistance is separate from sliding friction.
-4. `build_world()` forwards JSON morph parameters unchanged. Any Genesis API mismatch or desired normalization must be handled at this boundary or during config loading.
-5. The editor's landscape lookup depends on Genesis entity ordering and may be brittle if additional entities are inserted before or among landscape objects.
-6. The editor's comments/documentation are partly stale: the implementation uses `R` to restore the original pose, number keys for rotation, and does not implement Shift-based rotation.
-7. Pose serialization chooses Euler angles when `euler` exists or `quat` is absent, otherwise it writes quaternions. This preserves the existing representation in most cases but needs validation for each Genesis morph type.
-8. `src/sim/scene_config.py` imports `Tuple` and uses JSON arrays interchangeably with tuple annotations; this works through constructor assignment but `to_json()` emits arrays.
-
-## Useful commands
+The intended interpreter is the pyenv environment `ai`:
 
 ```bash
-python src/editor.py
-python src/eval.py --scene-config base
-python src/eval.py --scene-config src/sim/configs/base.json
+PYENV_VERSION=ai pyenv exec python src/editor.py
+PYENV_VERSION=ai pyenv exec python src/eval.py --scene-config base
+PYENV_VERSION=ai pyenv exec python -m py_compile <changed-files>
+PYENV_VERSION=ai pyenv exec python -m json.tool src/sim/configs/base.json
 ```
 
-Genesis/GPU availability and the installed dependency versions should be verified before attempting to run either executable. There is currently no automated test suite.
-
-## Relevant prior notes
-
-The `scratch/` directory contains the earlier editor plan and walkthrough. `scratch/EDITOR_CONTROLS.md` describes the intended keyboard workflow, while `scratch/implementation_plan.md` records the original proposal to migrate from the mathematical fallback scene to JSON.
+There is no automated test suite. Genesis execution requires compatible GPU/display support; the installed Genesis package may also trigger a Numba cache-location error in restricted environments.

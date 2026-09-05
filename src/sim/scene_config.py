@@ -48,7 +48,6 @@ class SceneConfig:
     mobiles: List[ObjectConfig] = field(default_factory=list)
     camera: CameraConfig = field(default_factory=CameraConfig)
     gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
-    show_viewer: bool = True
 
     def to_json(self, path: str):
         with open(path, 'w') as f:
@@ -67,8 +66,7 @@ class SceneConfig:
             landscape=landscape,
             mobiles=mobiles,
             camera=camera,
-            gravity=tuple(data.get('gravity', (0.0, 0.0, -9.81))),
-            show_viewer=data.get('show_viewer', True)
+            gravity=tuple(data.get('gravity', (0.0, 0.0, -9.81))),            
         )
 
 

@@ -42,6 +42,7 @@ def main() -> None:
     ghost_count = (args.steps + args.ghost_interval - 1) // args.ghost_interval
     world, trajectory_recorder = build_world(
         scene_config,
+        show_viewer=True,
         n_envs=args.n_envs,
         ghost_count=ghost_count,
     )
@@ -92,10 +93,10 @@ def main() -> None:
 
     # save frames ??
 
-    if scene_config.show_viewer:
-        print("Simulation finished. Close the viewer window to exit.")
-        while world.scene.viewer.is_alive():  # pyright: ignore
-            time.sleep(0.1)
+    # eval script is specifically for a viewer-enabled sim
+    print("Simulation finished. Close the viewer window to exit.")
+    while world.scene.viewer.is_alive():  # pyright: ignore
+        time.sleep(0.1)
 
 if __name__ == "__main__":
     main()

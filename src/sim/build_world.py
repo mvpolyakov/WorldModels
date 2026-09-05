@@ -59,6 +59,7 @@ def _add_object(scene, obj: ObjectConfig):
 
 def build_world(
     config: SceneConfig,
+    show_viewer: bool = True,
     n_envs: int = 1,
     ghost_count: int = 0,
 ) -> tuple[World, Optional[TrajectoryRecorder]]:
@@ -73,7 +74,7 @@ def build_world(
         A fully built World instance ready for stepping.
     """
     scene = gs.Scene(
-        show_viewer=config.show_viewer,
+        show_viewer=show_viewer,
         viewer_options=gs.options.ViewerOptions(
             camera_pos=config.camera.viewer_pos,
             camera_lookat=config.camera.viewer_lookat,
@@ -140,7 +141,7 @@ def build_world(
 
     scene.build(n_envs=n_envs, env_spacing=(2, 2))
 
-    if config.show_viewer:
+    if show_viewer:
         correct_camera_rotation_direction(scene.viewer)
 
     return world, trajectory_recorder
