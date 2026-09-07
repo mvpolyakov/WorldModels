@@ -13,6 +13,7 @@ from sim.utilities.sim_utils import (
     PredictionWorld,
 )
 from sim.utilities.viz_utils import save_displacement_error_chart
+from training.trajectories import create_randomized_rolling_scene
 from world_models import DummyWorldModel, PositionHistoryMLP
 
 def get_args():
@@ -24,6 +25,7 @@ def get_args():
     parser.add_argument("--output-error-chart", type=str, default="artifacts/displacement_error.png")
 
     parser.add_argument("--scene-config", type=str, default='base')
+    parser.add_argument("--randomize-scene", action="store_true")
 
     parser.add_argument("--model", type=str, default="")
     parser.add_argument("--device", type=str, default="cuda")
@@ -40,6 +42,9 @@ def main() -> None:
     gs.init(backend=gs.gpu)  # pyright: ignore
 
     scene_config = load_scene_config(args.scene_config)
+    if args.randomize_scene:
+        scene_config = create_randomized_rolling_scene(scene_config, 
+                                                       np.random.default_rng(None))
 
     ghost_count = 1 + args.steps // args.ghost_interval
     world, trajectory_recorder = build_world(
@@ -75,8 +80,11 @@ def main() -> None:
 
     # for now everything below (in this file) assumes predicted world exists
 
-    if trajectory_recorder is not None:
-        trajectory_recorder.set_up_predictions(predicted_world.mobile_positions)
+    # also adjusts the prediction's starting point based on the randomized config
+    trajectory_recorder.set_up_predictions(
+        predicted_world.mobile_positions,
+        scene_config,
+    )
 
     for step in range(args.steps):
         world.step()

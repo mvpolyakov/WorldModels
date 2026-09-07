@@ -19,3 +19,10 @@
 - Prefer explicit delegation over growing a central object with unrelated responsibilities. A domain service may be attached to `World` for access, but it should own its own state and behavior.
 - Represent scene components uniformly through the configuration model. If something is a scene component, include it as an ordinary entry in the appropriate list with the same representation as its peers; avoid special top-level config sections or special entity paths unless the semantics genuinely require them.
 - Favor data-driven configuration over hidden behavior. Physical and visual properties such as friction, rolling friction, textures, and object poses should be visible and adjustable in the scene config.
+
+## User preferences
+
+- Preserve user-authored changes and existing implementation choices. Before editing, inspect the current saved file and treat it as authoritative. Do not revert, replace, restore, or reintroduce code the user has removed, even if an earlier version or prior conversation contained it; ask first if the requested change depends on that code.
+- Apply the smallest change that fully implements the requested task. Avoid unrelated refactors, rewrites, formatting changes, or behavioral changes to existing code.
+- Keep validation and error handling proportionate to realistic failure modes; avoid defensive checks for invalid states that the application contract already rules out.
+- Use precise variable names that describe what a value contains; distinguish sizes, counts, and limits from the data itself (for example, `required_history_size` rather than `required_history`).

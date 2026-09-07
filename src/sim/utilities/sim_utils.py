@@ -158,12 +158,25 @@ class TrajectoryRecorder:
         self.prediction_ghosts = self._add_hidden_group((1.0, 0.35, 0.1, 0.28),
                                                  predicted_mobile_configs)
 
-    def set_up_predictions(self, predicted_mobiles):
+    def set_up_predictions(self, predicted_mobiles, scene_config):
         """Attach mobile objects owned by the separate prediction world.
             These will be used to position the pre-generated ghosts for capture
             at run time.
         """
         self.predicted_mobiles = predicted_mobiles
+
+        # adjust the prediction's starting point based on the randomized config 
+        # so rolls parallel to real ball however the ramp is rotated
+        ramp_config = next(obj for obj in scene_config.landscape if obj.name == "ramp")
+        ramp_direction_radians = np.deg2rad(ramp_config.morph_params["euler"][2])
+        prediction_offset_size = np.linalg.norm(self.prediction_lateral_offset[:2])
+        self.prediction_lateral_offset = np.array(
+            [
+                -np.sin(ramp_direction_radians) * prediction_offset_size,
+                np.cos(ramp_direction_radians) * prediction_offset_size,
+                0.0,
+            ]
+        )
 
     def capture(self):
         """Place one ghost for every actual and predicted mobile.
