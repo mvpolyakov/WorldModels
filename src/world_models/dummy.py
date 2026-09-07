@@ -18,7 +18,7 @@ class DummyWorldModel:
             position_history: Array with shape (B, K, T, 3), where B is the
                 number of environments, K is the number of mobiles, T is the
                 history length, and 3 contains XYZ coordinates.
-
+ 
         Returns:
             Array with the same (B, K, 3) shape as the input.
         """
