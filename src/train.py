@@ -7,10 +7,14 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 from sim.scene_config import load_scene_config
-from training import PositionHistoryDataset, SimulationTrajectoryCollector
+from training import (
+    PositionHistoryDataset,
+    SimulationTrajectoryCollector,
+    create_trajectory_dataset
+)
 from world_models import PositionHistoryMLP
 
 HISTORY_WINDOW = 5
@@ -19,6 +23,7 @@ def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a phase 1.0 position predictor.")
     parser.add_argument("--scene-config", default="base")
     parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--trajectories", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -52,8 +57,12 @@ def main() -> None:
 
     scene_config = load_scene_config(args.scene_config)
 
-    positions = SimulationTrajectoryCollector(scene_config).collect(args.steps)
-    dataset = PositionHistoryDataset(positions, HISTORY_WINDOW)
+    trajectories, dataset = create_trajectory_dataset(scene_config, 
+                                                        args.seed, 
+                                                        args.steps,
+                                                        args.trajectories,
+                                                        HISTORY_WINDOW)
+
     # Genesis sets PyTorch's default device to its backend during initialization.
     # Keep DataLoader indices and shuffle permutations on CPU.
     torch.set_default_device("cpu")
@@ -94,7 +103,7 @@ def main() -> None:
     output_dir = Path('artifacts/runs')
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(output_dir / "trajectory.npz", positions=positions)
+    np.savez(output_dir / "trajectory.npz", positions=np.stack(trajectories))
     torch.save(
         {
             "model_type": "PositionHistoryMLP",
