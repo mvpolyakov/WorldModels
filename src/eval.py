@@ -41,8 +41,7 @@ def main() -> None:
 
     scene_config = load_scene_config(args.scene_config)
 
-
-    ghost_count = (args.steps + args.ghost_interval - 1) // args.ghost_interval
+    ghost_count = 1 + args.steps // args.ghost_interval
     world, trajectory_recorder = build_world(
         scene_config,
         show_viewer=True,
