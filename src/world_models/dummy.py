@@ -8,17 +8,21 @@ class DummyWorldModel:
         self._random = np.random.default_rng(seed)
         self.offset_scale = offset_scale
 
-    def predict(self, current_positions: np.ndarray) -> np.ndarray:
+    def get_required_history(self) -> int:
+        return 1
+
+    def predict(self, position_history: np.ndarray) -> np.ndarray:
         """Predict a batch of all mobile positions.
 
         Args:
-            current_positions: Array with shape (B, K, 3), where B is the
-                number of environments, K is the number of mobiles, and 3
-                contains XYZ coordinates.
+            position_history: Array with shape (B, K, T, 3), where B is the
+                number of environments, K is the number of mobiles, T is the
+                history length, and 3 contains XYZ coordinates.
 
         Returns:
             Array with the same (B, K, 3) shape as the input.
         """
+        current_positions = np.asarray(position_history)[:, :, -1, :]
         predicted_positions = []
         for environment_positions in current_positions:
             environment_predictions = []

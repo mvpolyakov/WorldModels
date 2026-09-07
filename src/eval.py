@@ -3,6 +3,7 @@ import argparse
 import os
 import time
 import numpy as np
+import torch
 
 from sim.build_world import build_world
 from sim.scene_config import load_scene_config
@@ -12,7 +13,7 @@ from sim.utilities.sim_utils import (
     PredictionWorld,
 )
 from sim.utilities.viz_utils import save_displacement_error_chart
-from world_models import DummyWorldModel
+from world_models import DummyWorldModel, PositionHistoryMLP
 
 def get_args():
     parser = argparse.ArgumentParser(description="Build and run GRI eval.")
@@ -24,7 +25,9 @@ def get_args():
 
     parser.add_argument("--scene-config", type=str, default='base')
 
-    #    parser.add_argument("--model", type=str, default="")
+    parser.add_argument("--model", type=str, default="")
+    parser.add_argument("--device", type=str, default="cuda")
+
     # later also add randomization options - with seed
 
     args = parser.parse_args()
@@ -50,9 +53,25 @@ def main() -> None:
     add_scene_controls(world)
 
     # load model if any
-    model = DummyWorldModel()
+    if args.model == '':
+        print('loading dummy random model')
+        model = DummyWorldModel()
+    else:
+        print('loading ', args.model)
+        checkpoint = torch.load(args.model, map_location=args.device)
+        model = PositionHistoryMLP(
+            history_length=checkpoint["history_length"],
+            hidden_size=checkpoint["hidden_size"],
+        )
+        model.load_state_dict(checkpoint["state_dict"])
+        model.to(args.device)
+        model.eval()
 
-    predicted_world = PredictionWorld(scene_config.mobiles, model, n_envs=args.n_envs)
+    predicted_world = PredictionWorld(
+        scene_config.mobiles,
+        model,
+        n_envs=args.n_envs,
+    )
     displacement_error = DisplacementErrorTracker()
 
     # for now everything below (in this file) assumes predicted world exists

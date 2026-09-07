@@ -6,7 +6,14 @@ import genesis as gs
 
 
 class PredictionWorld:
-    """Prediction-only world containing mobile state and a world model."""
+    """Prediction-only world containing mobile state and a world model.
+        For models that require history, keeps track of that as well 
+
+        Specifically, mobile_positions is the 3d tensor of current positions,
+        on step() that's updated with another model's prediction.  position_history
+        contains the full history of mobile_positions, with the last value along the 
+        time dimension==mobile_positions.  step() updates both.
+    """
 
     def __init__(self, mobile_configs, model, n_envs=1):
         self.model = model
@@ -21,19 +28,34 @@ class PredictionWorld:
             n_envs,
             axis=0,
         )
+        # history of the positions - with the time dimensions added as 3rd axis
+        self.position_history = self.mobile_positions[:, :, None, :].copy()
 
     def step(self):
         """Advance each predicted mobile by one model step.
 
         ``mobile_positions`` is a (B, K, 3) array containing all environments
         and mobiles, and the model receives that array directly.
+        
+        position_history adds a T time dimension to it
+
         """
-        predicted_positions = self.model.predict(self.mobile_positions)
+        required_history_size = self.model.get_required_history()
+
+        desired_history = self.position_history[:, :, -required_history_size:, :]
+
+        predicted_positions = self.model.predict(desired_history)
+
+        self.position_history = np.concatenate(
+            [self.position_history, predicted_positions[:, :, None, :]],
+            axis=2,
+        )
+
         self.mobile_positions[...] = predicted_positions
 
 
 class DisplacementErrorTracker:
-    """Track summed planar displacement error across simulation steps."""
+    """Track summed displacement error across simulation steps."""
 
     def __init__(self):
         self.values = []
