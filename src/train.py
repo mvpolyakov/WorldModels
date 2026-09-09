@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import ConcatDataset, DataLoader
 
-from sim.scene_config import load_scene_config
+from sim.build_world import load_world_builder
 from training import (
     PositionHistoryDataset,
     SimulationTrajectoryCollector,
@@ -19,9 +19,50 @@ from world_models import PositionHistoryMLP
 
 HISTORY_WINDOW = 5
 
+def train_model(model, 
+                data_loader, 
+                config,
+                device):
+    
+    optimizer = torch.optim.Adam(model.parameters(), config['lr'])
+
+    losses = []
+
+    for epoch in range(config['epochs']):
+        model.train()
+
+        total_loss = 0.0
+        sample_count = 0
+
+        for histories, targets in data_loader:
+            histories = histories.to(device)
+            targets = targets.to(device)
+            optimizer.zero_grad()
+            predictions = model(histories)
+            loss = torch.mean((predictions - targets) ** 2)
+            if not torch.isfinite(loss):
+                raise RuntimeError("Training loss became non-finite.")
+            loss.backward()
+            optimizer.step()
+            count = len(histories)
+            total_loss += loss.item() * count
+            sample_count += count
+
+        losses.append(total_loss / sample_count)
+
+        if epoch % 10 == 0:
+            print   ('epoch', epoch)
+
+    # Once training structure changes and it makes sense, may be add an overall evaluation here?
+    #model.eval()
+    #with torch.inference_mode():
+    #  ...
+
+    return losses
+
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a phase 1.0 position predictor.")
-    parser.add_argument("--scene-config", default="base")
+    parser.add_argument("--world-builder", default="simple-rolling")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--trajectories", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=50)
@@ -36,7 +77,6 @@ def get_args() -> argparse.Namespace:
     )
    # parser.add_argument("--output-dir", default="artifacts/phase1_0/run_001")
     return parser.parse_args()
-
 
 def main() -> None:
     args = get_args()
@@ -55,9 +95,9 @@ def main() -> None:
     else:
         gs.init(backend=gs.gpu)
 
-    scene_config = load_scene_config(args.scene_config)
+    world_builder = load_world_builder(args.world_builder)
 
-    trajectories, dataset = create_trajectory_dataset(scene_config, 
+    trajectories, dataset = create_trajectory_dataset(world_builder,
                                                         args.seed, 
                                                         args.steps,
                                                         args.trajectories,
@@ -69,36 +109,13 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
     model = PositionHistoryMLP(HISTORY_WINDOW, args.hidden_size).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
-    losses = []
+    config = {'lr': args.learning_rate,
+              'epochs': args.epochs
+              }
 
-    for epoch in range(args.epochs):
-        model.train()
-        total_loss = 0.0
-        sample_count = 0
-        for histories, targets in loader:
-            histories = histories.to(device)
-            targets = targets.to(device)
-            optimizer.zero_grad()
-            predictions = model(histories)
-            loss = torch.mean((predictions - targets) ** 2)
-            if not torch.isfinite(loss):
-                raise RuntimeError("Training loss became non-finite.")
-            loss.backward()
-            optimizer.step()
-            count = len(histories)
-            total_loss += loss.item() * count
-            sample_count += count
-        losses.append(total_loss / sample_count)
-
-        if epoch % 10 == 0:
-            print   ('epoch', epoch)
-
-    # Once training structure changes and it makes sense, may be add an overall evaluation here?
-    #model.eval()
-    #with torch.inference_mode():
-    #  ...
+    # Later move into a dedicated class
+    losses = train_model(model, loader, config, device)
 
     output_dir = Path('artifacts/runs')
 

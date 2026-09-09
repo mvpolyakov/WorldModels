@@ -5,26 +5,23 @@ import time
 import numpy as np
 import torch
 
-from sim.build_world import build_world
-from sim.scene_config import load_scene_config
+from sim.build_world import load_world_builder
 from sim.dataclasses import add_scene_controls
 from sim.utilities.sim_utils import (
     DisplacementErrorTracker,
     PredictionWorld,
 )
 from sim.utilities.viz_utils import save_displacement_error_chart
-from training.trajectories import create_randomized_rolling_scene
 from world_models import DummyWorldModel, PositionHistoryMLP
 
 def get_args():
     parser = argparse.ArgumentParser(description="Build and run GRI eval.")
-    parser.add_argument("-n", "--n-envs", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--ghost-interval", type=int, default=10)
     parser.add_argument("--output-image", type=str, default="artifacts/ball_path.png")
     parser.add_argument("--output-error-chart", type=str, default="artifacts/displacement_error.png")
 
-    parser.add_argument("--scene-config", type=str, default='base')
+    parser.add_argument("--world", type=str, default="simple-rolling")
     parser.add_argument("--randomize-scene", action="store_true")
 
     parser.add_argument("--model", type=str, default="")
@@ -41,22 +38,8 @@ def main() -> None:
 
     gs.init(backend=gs.gpu)  # pyright: ignore
 
-    scene_config = load_scene_config(args.scene_config)
-    if args.randomize_scene:
-        scene_config = create_randomized_rolling_scene(scene_config, 
-                                                       np.random.default_rng(None))
+    # Load model
 
-    ghost_count = 1 + args.steps // args.ghost_interval
-    world, trajectory_recorder = build_world(
-        scene_config,
-        show_viewer=True,
-        n_envs=args.n_envs,
-        ghost_count=ghost_count,
-    )
-
-    add_scene_controls(world)
-
-    # load model if any
     if args.model == '':
         print('loading dummy random model')
         model = DummyWorldModel()
@@ -71,24 +54,45 @@ def main() -> None:
         model.to(args.device)
         model.eval()
 
-    predicted_world = PredictionWorld(
-        scene_config.mobiles,
-        model,
-        n_envs=args.n_envs,
+    # Create world
+
+    world_builder = load_world_builder(args.world)
+
+    ghost_count = max(
+        1 + args.steps // args.ghost_interval,
+        model.get_required_history(),
     )
+
+    random_generator = np.random.default_rng(None) if args.randomize_scene else None
+
+    world, trajectory_recorder = world_builder.build(
+        show_viewer=True,
+        n_environments=1,
+        ghost_count=ghost_count,
+        random_generator=random_generator,
+    )
+
+    add_scene_controls(world)
+
+    # Set up prediction and trajectory recording
+
+    initial_mobile_positions = np.stack(
+        [
+            mobile.get_pos().detach().cpu().numpy()
+            for mobile in world.mobiles.values()
+        ],
+        axis=1,
+    )
+    predicted_world = PredictionWorld(initial_mobile_positions, model)
     displacement_error = DisplacementErrorTracker()
 
     # for now everything below (in this file) assumes predicted world exists
 
-    # also adjusts the prediction's starting point based on the randomized config
-    trajectory_recorder.set_up_predictions(
-        predicted_world.mobile_positions,
-        scene_config,
-    )
+    trajectory_recorder.set_up_predictions(predicted_world.mobile_positions)
+    trajectory_recorder.capture_observation(initial_mobile_positions)
 
     for step in range(args.steps):
         world.step()
-        predicted_world.step()
 
         actual_positions = np.stack(
             [
@@ -98,6 +102,13 @@ def main() -> None:
             axis=1,
         )
 
+        if predicted_world.needs_warm_up():
+            predicted_world.observe(actual_positions)
+            if (step + 1) % args.ghost_interval == 0:
+                trajectory_recorder.capture_observation(actual_positions)
+            continue
+
+        predicted_world.step()
         displacement_error.update(actual_positions, predicted_world.mobile_positions)
 
         if trajectory_recorder is not None and (step + 1) % args.ghost_interval == 0:

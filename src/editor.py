@@ -7,7 +7,7 @@ import torch
 from scipy.spatial.transform import Rotation as R
 
 from sim.scene_config import load_scene_config
-from sim.build_world import build_world 
+from sim.build_world import WorldBuilder
 
 class SceneEditor:
     def __init__(self, config_path: str):
@@ -19,13 +19,16 @@ class SceneEditor:
             if 'fixed' not in obj.morph_params:
                 obj.morph_params['fixed'] = True
 
-        self.world, _ = build_world(self.config, n_envs=1)
+        self.world, _ = WorldBuilder.scaffold_world(
+            self.config,
+            n_environments=1,
+        )
         
         self.entities = []
         self.original_poses = {} # {name: (pos, quat)}
         
         # Gather all entities without relying on World.landscape
-        # Creation order in build_world: 0..N=Landscape
+        # Creation order in scaffold_world: 0..N=Landscape
         landscape_configs = self.config.landscape
         for i, cfg in enumerate(landscape_configs):
             ent = self.world.scene.entities[i]
@@ -183,7 +186,7 @@ class SceneEditor:
 def main():
     import os
     parser = argparse.ArgumentParser()
-    default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim", "configs", "base.json")
+    default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim", "configs", "simple_rolling.json")
     parser.add_argument("--config", type=str, default=default_config)
     args = parser.parse_args()
 

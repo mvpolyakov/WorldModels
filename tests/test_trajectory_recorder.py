@@ -1,38 +1,70 @@
-import sys
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import genesis as gs
 import numpy as np
 
-sys.modules.setdefault("genesis", SimpleNamespace())
+from sim.build_world import SimpleRollingWorldBuilder
+from sim.utilities.sim_utils import PredictionWorld, TrajectoryRecorder
 
-from sim.utilities.sim_utils import TrajectoryRecorder
+
+class ThreeFrameModel:
+    def get_required_history(self):
+        return 3
+
+    def predict(self, position_history):
+        return position_history[:, :, -1, :] + 1.0
+
+
+class PredictionWorldTest(unittest.TestCase):
+    def test_observations_warm_up_history_before_prediction(self):
+        predicted_world = PredictionWorld(np.zeros((1, 1, 3)), ThreeFrameModel())
+
+        self.assertTrue(predicted_world.needs_warm_up())
+        predicted_world.observe(np.ones((1, 1, 3)))
+        self.assertTrue(predicted_world.needs_warm_up())
+        predicted_world.observe(np.full((1, 1, 3), 2.0))
+        self.assertFalse(predicted_world.needs_warm_up())
+
+        predicted_world.step()
+
+        np.testing.assert_allclose(predicted_world.mobile_positions, 3.0)
 
 
 class TrajectoryRecorderTest(unittest.TestCase):
     def test_prediction_offset_preserves_height_for_rotated_ramps(self):
         starting_positions = np.array([[[0.3, -0.2, 1.4]]])
+        world_builder = SimpleRollingWorldBuilder()
+        ramp = SimpleNamespace(get_quat=lambda: np.zeros((1, 4)))
+        world = SimpleNamespace(landscape={world_builder.ramp_config.name: ramp})
 
         for ramp_direction_degrees in (-135.0, -15.5, 0.0, 12, 47.0, 163.0):
             with self.subTest(ramp_direction_degrees=ramp_direction_degrees):
-                trajectory_recorder = TrajectoryRecorder.__new__(TrajectoryRecorder)
-                trajectory_recorder.prediction_lateral_offset = np.array([0.0, 0.5, 0.0])
-                ramp_config = SimpleNamespace(
-                    name="ramp",
-                    morph_params={"euler": (0.0, -20.0, ramp_direction_degrees)},
-                )
-                scene_config = SimpleNamespace(landscape=[ramp_config])
+                with patch.object(
+                    gs.utils.geom,
+                    "quat_to_xyz",
+                    return_value=np.array(
+                        [[0.0, 0.0, np.deg2rad(ramp_direction_degrees)]]
+                    ),
+                ):
+                    trajectory_recorder = TrajectoryRecorder.__new__(TrajectoryRecorder)
+                    captured_positions = []
+                    trajectory_recorder.predicted_mobile_names = ["ball"]
+                    trajectory_recorder.observation_ghosts = {
+                        "ball": [SimpleNamespace(set_pos=captured_positions.append)]
+                    }
+                    trajectory_recorder._next_observation_ghost = 0
+                    trajectory_recorder.set_prediction_lateral_offset(
+                        world_builder._get_prediction_lateral_offset(world)
+                    )
+                    trajectory_recorder.set_up_predictions(starting_positions)
+                    trajectory_recorder.capture_observation(starting_positions)
 
-                trajectory_recorder.set_up_predictions(starting_positions, scene_config)
-
-                offset_starting_positions = (
-                    trajectory_recorder.predicted_mobiles
-                    + trajectory_recorder.prediction_lateral_offset
-                )
-                np.testing.assert_allclose(
-                    offset_starting_positions[..., 2],
-                    starting_positions[..., 2],
-                )
+                    np.testing.assert_allclose(
+                        captured_positions[0][..., 2],
+                        starting_positions[:, 0, 2],
+                    )
 
 
 if __name__ == "__main__":

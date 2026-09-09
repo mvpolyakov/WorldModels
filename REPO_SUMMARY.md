@@ -39,8 +39,8 @@ Evaluation should distinguish prediction on held-out scenarios and property comb
 
 ## Architecture
 
-- `src/sim/scene_config.py` defines scene dataclasses and loads configuration. An existing JSON path is checked first, then `src/sim/configs/<key>.json`, then the in-code fallback configuration.
-- `src/sim/build_world.py` converts configuration objects into Genesis entities and assembles the scene. It returns the physical `World` plus optional visualization services.
+- `src/sim/scene_config.py` defines the generic configuration dataclasses and JSON loading.
+- `src/sim/build_world.py` defines the `WorldBuilder` interface and its generic `scaffold_world()` method. `SimpleRollingWorldBuilder` owns `simple_rolling.json`, rolling-world randomization, and prediction visualization setup.
 - `src/sim/dataclasses.py` contains the `World` wrapper and viewer controls.
 - `src/eval.py` is the rollout/evaluation entry point.
 - `src/editor.py` is the interactive scene editor and config saver.
@@ -61,9 +61,9 @@ The intended interpreter is the pyenv environment `ai`:
 
 ```bash
 PYENV_VERSION=ai pyenv exec python src/editor.py
-PYENV_VERSION=ai pyenv exec python src/eval.py --scene-config base
+PYENV_VERSION=ai pyenv exec python src/eval.py --world-builder simple-rolling
 PYENV_VERSION=ai pyenv exec python -m py_compile <changed-files>
-PYENV_VERSION=ai pyenv exec python -m json.tool src/sim/configs/base.json
+PYENV_VERSION=ai pyenv exec python -m json.tool src/sim/configs/simple_rolling.json
 ```
 
 There is no automated test suite. Genesis execution requires compatible GPU/display support; the installed Genesis package may also trigger a Numba cache-location error in restricted environments.

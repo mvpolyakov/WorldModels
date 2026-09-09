@@ -7,9 +7,10 @@ class World:
     '''
     A bundle of all the objects that make up a world and a single .step() function.
     '''
-    def __init__(self, scene: gs.Scene, mobiles=None, agent=None):
+    def __init__(self, scene: gs.Scene, mobiles=None, landscape=None, agent=None):
         self.scene = scene
         self.mobiles = mobiles or {}
+        self.landscape = landscape or {}
         self.agent = agent
         
     def step(self):

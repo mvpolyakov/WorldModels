@@ -12,24 +12,28 @@ class PredictionWorld:
         Specifically, mobile_positions is the 3d tensor of current positions,
         on step() that's updated with another model's prediction.  position_history
         contains the full history of mobile_positions, with the last value along the 
-        time dimension==mobile_positions.  step() updates both.
+        time dimension==mobile_positions. Observations seed the history during warm-up,
+        then step() updates both with predictions.
     """
 
-    def __init__(self, mobile_configs, model, n_envs=1):
+    def __init__(self, initial_mobile_positions, model):
         self.model = model
-        # list of 3d positions (1 per object)
-        initial_positions = [
-            np.asarray(config.morph_params["pos"], dtype=float)
-            for config in mobile_configs
-        ]
-        # create 3d tensor: Bxkx3 with k=# of mobiles
-        self.mobile_positions = np.repeat(
-            np.asarray(initial_positions)[None, :, :],
-            n_envs,
-            axis=0,
-        )
+        # Position tensor: BxKx3 with K mobiles.
+        self.mobile_positions = np.asarray(initial_mobile_positions, dtype=float).copy()
         # history of the positions - with the time dimensions added as 3rd axis
         self.position_history = self.mobile_positions[:, :, None, :].copy()
+
+    def needs_warm_up(self):
+        """Return whether the model still needs observed history."""
+        return self.position_history.shape[2] < self.model.get_required_history()
+
+    def observe(self, observed_mobile_positions):
+        """Add observed positions to the prediction history during warmup."""
+        self.mobile_positions[...] = observed_mobile_positions
+        self.position_history = np.concatenate(
+            [self.position_history, observed_mobile_positions[:, :, None, :]],
+            axis=2,
+        )
 
     def step(self):
         """Advance each predicted mobile by one model step.
@@ -110,7 +114,7 @@ def correct_camera_rotation_direction(viewer):
 
 
 class TrajectoryRecorder:
-    """Capture translucent snapshots for multiple actual and predicted mobiles."""
+    """Capture translucent snapshots for actual, observed, and predicted mobiles."""
 
     # During init, pre-create all the ghost objects at the outset and store under the plane (z=-100) 
     # and when time to capture just move them into the desired positions 
@@ -142,7 +146,6 @@ class TrajectoryRecorder:
         actual_mobile_configs,
         predicted_mobile_configs,
         ghost_count,
-        prediction_lateral_offset=(0.0, .5, 0.0),
     ):
         self.scene = scene
         self.actual_mobiles = actual_mobiles
@@ -150,33 +153,36 @@ class TrajectoryRecorder:
         self.actual_mobile_configs = {config.name: config for config in actual_mobile_configs}
         self.predicted_mobile_configs = {config.name: config for config in predicted_mobile_configs}
         self.predicted_mobile_names = [config.name for config in predicted_mobile_configs]
-        self.prediction_lateral_offset = np.asarray(prediction_lateral_offset, dtype=float)
         self.ghost_count = ghost_count
         self._next_ghost = 0
+        self._next_observation_ghost = 0
         self.ghosts = self._add_hidden_group((0.2, 0.6, 1.0, 0.28), 
                                       actual_mobile_configs)
+        self.observation_ghosts = self._add_hidden_group((1.0, 0.85, 0.1, 0.28),
+                                                  predicted_mobile_configs)
         self.prediction_ghosts = self._add_hidden_group((1.0, 0.35, 0.1, 0.28),
                                                  predicted_mobile_configs)
 
-    def set_up_predictions(self, predicted_mobiles, scene_config):
-        """Attach mobile objects owned by the separate prediction world.
-            These will be used to position the pre-generated ghosts for capture
-            at run time.
-        """
+    def set_prediction_lateral_offset(self, prediction_lateral_offset):
+        """Set the display offset applied to predicted trajectory ghosts."""
+        self.prediction_lateral_offset = np.asarray(
+            prediction_lateral_offset,
+            dtype=float,
+        )
+
+    def set_up_predictions(self, predicted_mobiles):
+        """Attach the predicted mobile positions used during capture."""
         self.predicted_mobiles = predicted_mobiles
 
-        # adjust the prediction's starting point based on the randomized config 
-        # so rolls parallel to real ball however the ramp is rotated
-        ramp_config = next(obj for obj in scene_config.landscape if obj.name == "ramp")
-        ramp_direction_radians = np.deg2rad(ramp_config.morph_params["euler"][2])
-        prediction_offset_size = np.linalg.norm(self.prediction_lateral_offset[:2])
-        self.prediction_lateral_offset = np.array(
-            [
-                -np.sin(ramp_direction_radians) * prediction_offset_size,
-                np.cos(ramp_direction_radians) * prediction_offset_size,
-                0.0,
-            ]
-        )
+    def capture_observation(self, observed_mobile_positions):
+        """Place one laterally offset ghost for every observed mobile."""
+        for index, name in enumerate(self.predicted_mobile_names):
+            position = observed_mobile_positions[:, index, :]
+            self.observation_ghosts[name][self._next_observation_ghost].set_pos(
+                position + self.prediction_lateral_offset
+            )
+
+        self._next_observation_ghost += 1
 
     def capture(self):
         """Place one ghost for every actual and predicted mobile.

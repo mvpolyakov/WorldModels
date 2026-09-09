@@ -1,7 +1,7 @@
 import json
+import os
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Tuple, Any
-
 
 @dataclass
 class ObjectConfig:
@@ -70,92 +70,20 @@ class SceneConfig:
         )
 
 
-# ---------------------------------------------------------------------------
-# Pre-built configs
-# ---------------------------------------------------------------------------
+def load_scene_config(config_path_or_file_name: str = "simple_rolling.json") -> SceneConfig:
+    """Load a config from a path or from the built-in config directory."""
 
-def _base_config() -> SceneConfig:
-    """Ramp + sphere scene."""
-    import math
-    angle_deg = 25.0
-    angle_rad = math.radians(angle_deg)
-    ramp_length = 2.0
-    ramp_thickness = 0.05
+    if os.path.exists(config_path_or_file_name):
+        return SceneConfig.from_json(config_path_or_file_name)
 
-    # Ramp centre so its low end sits at ground level
-    low_z = ramp_thickness / 2.0
-    centre_z = low_z + (ramp_length / 2.0) * math.sin(angle_rad)
-
-    # Ball at the high end of the ramp with clearance
-    ball_radius = 0.2
-    ball_x = -(ramp_length / 2.0) * math.cos(angle_rad)
-    ball_z = (ramp_thickness / 2.0
-              + ramp_length * math.sin(angle_rad)
-              + ball_radius + 0.01)
-
-    return SceneConfig(
-        landscape=[
-            ObjectConfig(
-                name="ramp",
-                morph_type="Box",
-                morph_params=dict(
-                    pos=(0.0, 0.0, centre_z),
-                    euler=(0.0, -angle_deg, 0.0),
-                    size=(ramp_length, 2.5, ramp_thickness),
-                    fixed=True,
-                ),
-                friction=0.4,
-                color=(0.6, 0.5, 0.4, 1.0),
-            ),
-            ObjectConfig(
-                name="ground",
-                morph_type="Box",
-                morph_params=dict(
-                    pos=(0.0, 0.0, -0.025),
-                    size=(20.0, 20.0, 0.05),
-                    fixed=True,
-                ),
-                friction=1.0,
-                friction_rolling=0.005,
-                color=(0.3, 0.3, 0.3, 1.0),
-            ),
-        ],
-        mobiles=[
-            ObjectConfig(
-                name="ball",
-                morph_type="Sphere",
-                morph_params=dict(
-                    pos=(ball_x, 0.0, ball_z),
-                    radius=ball_radius,
-                ),
-                friction=0.3,
-                rho=500.0,
-                color=(0.2, 0.6, 1.0, 1.0),
-            ),
-        ],
+    config_file_name = (
+        config_path_or_file_name
+        if config_path_or_file_name.endswith(".json")
+        else f"{config_path_or_file_name}.json"
     )
-
-
-_scene_configs = {
-    'base': _base_config,
-}
-
-
-def load_scene_config(key: str = 'base') -> SceneConfig:
-    import os
-    if key.endswith('.json') and os.path.exists(key):
-        return SceneConfig.from_json(key)
-        
-    # Also check if it exists in the configs directory automatically
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    json_path = os.path.join(current_dir, "configs", f"{key}.json")
-    
-    if os.path.exists(json_path):
-        return SceneConfig.from_json(json_path)
-        
-    if key not in _scene_configs:
-        raise ValueError(f"Scene config '{key}' not found. Available: {list(_scene_configs)}")
-    
-    scene_generator = _scene_configs[key]
-    
-    return scene_generator()
+    config_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "configs",
+        config_file_name,
+    )
+    return SceneConfig.from_json(config_path)

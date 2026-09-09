@@ -17,6 +17,8 @@
 - Prefer clear, semantic names that communicate an object's role and distinguish related concepts. For example, use names such as `TrajectoryRecorder`, `mobile`, and `mobile_config` instead of ambiguous names like `data` or `obj` when the distinction matters.
 - Encapsulate behavior according to its domain meaning. For example: keep `World` focused on simulation orchestration and core world state; put trajectory capture, ghost lifecycle, capture indexing, and image export in a dedicated `TrajectoryRecorder`.
 - Prefer explicit delegation over growing a central object with unrelated responsibilities. A domain service may be attached to `World` for access, but it should own its own state and behavior.
+- When moving a function into a class as a method, put the implementation in that method rather than leaving a one-use forwarding wrapper, unless the separate function has an independent use.
+- When a refactor definitively makes code obsolete, remove it as part of the change, including stale validation, special cases, helpers, imports, and comments.
 - Represent scene components uniformly through the configuration model. If something is a scene component, include it as an ordinary entry in the appropriate list with the same representation as its peers; avoid special top-level config sections or special entity paths unless the semantics genuinely require them.
 - Favor data-driven configuration over hidden behavior. Physical and visual properties such as friction, rolling friction, textures, and object poses should be visible and adjustable in the scene config.
 
