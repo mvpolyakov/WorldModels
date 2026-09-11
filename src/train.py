@@ -19,48 +19,68 @@ from world_models import PositionHistoryMLP
 
 HISTORY_WINDOW = 5
 
-def train_model(model, 
-                data_loader, 
+def _process_epoch_pass(model, data_loader, device, optimizer):
+    total_loss = 0.0
+    sample_count = 0
+
+    for batch in data_loader:
+        histories, targets, scene_features = batch
+        histories = histories.to(device)
+        targets = targets.to(device)
+        scene_features = scene_features.to(device)
+        if optimizer is not None:
+            optimizer.zero_grad()
+
+        predictions = model(histories, scene_features)
+        loss = torch.mean((predictions - targets) ** 2)
+        if not torch.isfinite(loss):
+            error = ('Validation' if optimizer is None else 'Training') + "loss became non-finite."
+            raise RuntimeError(error)
+        
+        if optimizer is not None:
+            loss.backward()
+            optimizer.step()
+
+        count = len(histories)
+        total_loss += loss.item() * count
+        sample_count += count
+
+    return total_loss / sample_count
+
+def train_model(model,
+                train_data_loader,
+                validation_data_loader,
                 config,
                 device):
-    
+
     optimizer = torch.optim.Adam(model.parameters(), config['lr'])
 
-    losses = []
+    training_errors = []
+    validation_errors = []
 
     for epoch in range(config['epochs']):
         model.train()
 
-        total_loss = 0.0
-        sample_count = 0
+        mean_error =_process_epoch_pass(model, 
+                                        train_data_loader, 
+                                        device, 
+                                        optimizer)
 
-        for batch in data_loader:
-            histories, targets, scene_features = batch
-            histories = histories.to(device)
-            targets = targets.to(device)
-            scene_features = scene_features.to(device)
-            optimizer.zero_grad()
-            predictions = model(histories, scene_features)
-            loss = torch.mean((predictions - targets) ** 2)
-            if not torch.isfinite(loss):
-                raise RuntimeError("Training loss became non-finite.")
-            loss.backward()
-            optimizer.step()
-            count = len(histories)
-            total_loss += loss.item() * count
-            sample_count += count
+        training_errors.append(mean_error)
 
-        losses.append(total_loss / sample_count)
+        model.eval()
+        with torch.inference_mode():
+            mean_error =_process_epoch_pass(model, 
+                                            validation_data_loader, 
+                                            device, 
+                                            None)
 
-        if epoch % 10 == 0:
+            validation_errors.append(mean_error)
+
+        if epoch % 2 == 0:
             print   ('epoch', epoch)
 
-    # Once training structure changes and it makes sense, may be add an overall evaluation here?
-    #model.eval()
-    #with torch.inference_mode():
-    #  ...
-
-    return losses
+    return training_errors, validation_errors
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a phase 1.0 position predictor.")
@@ -99,16 +119,27 @@ def main() -> None:
 
     world_builder = load_world_builder(args.world_builder)
 
-    trajectories, dataset = create_trajectory_dataset(world_builder,
-                                                        args.seed, 
-                                                        args.steps,
-                                                        args.trajectories,
-                                                        HISTORY_WINDOW)
+    trajectories, training_dataset, validation_dataset = create_trajectory_dataset(
+        world_builder,
+        args.seed,
+        args.steps,
+        args.trajectories,
+        HISTORY_WINDOW,
+    )
 
     # Genesis sets PyTorch's default device to its backend during initialization.
     # Keep DataLoader indices and shuffle permutations on CPU.
     torch.set_default_device("cpu")
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    training_loader = DataLoader(
+        training_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
 
     model = PositionHistoryMLP(HISTORY_WINDOW, args.hidden_size).to(device)
 
@@ -117,7 +148,13 @@ def main() -> None:
               }
 
     # Later move into a dedicated class
-    losses = train_model(model, loader, config, device)
+    training_errors, validation_errors = train_model(
+        model,
+        training_loader,
+        validation_loader,
+        config,
+        device,
+    )
 
     output_dir = Path('artifacts/runs')
 
@@ -128,7 +165,9 @@ def main() -> None:
         scene_features=np.stack(
             [
                 trajectory_dataset.scene_features
-                for trajectory_dataset in dataset.datasets
+                for trajectory_dataset in (
+                    training_dataset.datasets + validation_dataset.datasets
+                )
             ]
         ),
     )
@@ -143,7 +182,13 @@ def main() -> None:
         output_dir / "checkpoint.tar",
     )
     (output_dir / "metrics.json").write_text(
-        json.dumps({"epochs": losses}, indent=2)
+        json.dumps(
+            {
+                "training_error": training_errors,
+                "validation_error": validation_errors,
+            },
+            indent=2,
+        )
     )
     print(f"Saved phase 1.0 artifacts to {output_dir}")
 

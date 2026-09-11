@@ -99,6 +99,9 @@ def create_trajectory_dataset(world_builder,
     create n_trajectories randomized rollouts for teaching a model basic rolling physics
     '''
 
+    if n_trajectories < 2:
+        raise ValueError("At least 2 trajectories are required for training and validation.")
+
     random_generator = np.random.default_rng(None if seed == 0 else seed)
     trajectories, scene_features = SimulationTrajectoryCollector(
         world_builder
@@ -108,13 +111,34 @@ def create_trajectory_dataset(world_builder,
         n_environments=n_trajectories,
         random_generator=random_generator,
     )
-    trajectory_datasets = [
+    validation_trajectory_count = max(1, n_trajectories // 5)
+    training_trajectory_count = n_trajectories - validation_trajectory_count
+
+    training_trajectory_datasets = [
         PositionHistoryDataset(
             positions,
             required_history,
             scene_features=features,
         )
-        for positions, features in zip(trajectories, scene_features)
+        for positions, features in zip(
+            trajectories[:training_trajectory_count],
+            scene_features[:training_trajectory_count],
+        )
+    ]
+    validation_trajectory_datasets = [
+        PositionHistoryDataset(
+            positions,
+            required_history,
+            scene_features=features,
+        )
+        for positions, features in zip(
+            trajectories[training_trajectory_count:],
+            scene_features[training_trajectory_count:],
+        )
     ]
 
-    return trajectories, ConcatDataset(trajectory_datasets)
+    return (
+        trajectories,
+        ConcatDataset(training_trajectory_datasets),
+        ConcatDataset(validation_trajectory_datasets),
+    )
