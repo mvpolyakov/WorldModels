@@ -4,15 +4,23 @@ import numpy as np
 import torch
 from torch import nn
 
+SCENE_FEATURE_SIZE = 10
+
 
 class PositionHistoryMLP(nn.Module):
-    """Predict the next XYZ position from a fixed history of positions."""
+    """Predict the next XYZ position from position history and scene context."""
 
-    def __init__(self, history_length: int = 5, hidden_size: int = 64):
+    def __init__(
+        self,
+        history_length: int = 5,
+        hidden_size: int = 64,
+        scene_feature_size: int = SCENE_FEATURE_SIZE,
+    ):
         super().__init__()
         self.history_length = history_length
+        self.scene_feature_size = scene_feature_size
         self.network = nn.Sequential(
-            nn.Linear(history_length * 3, hidden_size),
+            nn.Linear(history_length * 3 + scene_feature_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
@@ -22,20 +30,45 @@ class PositionHistoryMLP(nn.Module):
     def get_required_history(self) -> int:
         return self.history_length
 
-    def forward(self, history: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        history: torch.Tensor,
+        scene_features: torch.Tensor,
+    ) -> torch.Tensor:
         '''
-        history: (Batch x objects - premultiplied) x history x 3(xyz) tensor 
+        history: (batch, history, 3) tensor of XYZ positions.
+        scene_features: (batch, 10) ramp center, two ramp axes, and ball radius.
         '''
         if history.ndim != 3 or history.shape[1:] != (self.history_length, 3):
             raise ValueError(
                 f"history must have shape (batch, {self.history_length}, 3)"
             )
-        # flatten history x xyz into one dimension
-        return self.network(history.reshape(history.shape[0], -1))
+        
+        if scene_features.ndim != 2 or scene_features.shape != (
+            history.shape[0],
+            self.scene_feature_size,
+        ):
+            raise ValueError(
+                "scene_features must have shape "
+                f"(batch, {self.scene_feature_size})"
+            )
 
-    # just a helpful method for inference - when dealing with simulator at each step -- not for training
+        # Keep scene context separate until the final input assembly so the
+        # model interface can later be fed by an image-based scene encoder.
+        inputs = torch.cat(
+            [history.reshape(history.shape[0], -1), scene_features],
+            dim=1,
+        )
+        return self.network(inputs)
+
+    # just a helpful method for inference - when dealing with simulator 
+    # at each step - handles type conversion and input reshaping -- not for training
     @torch.inference_mode()
-    def predict(self, history: np.ndarray) -> np.ndarray:
+    def predict(
+        self,
+        history: np.ndarray,
+        scene_features: np.ndarray,
+    ) -> np.ndarray:
         values = np.asarray(history, dtype=np.float32)
 
         if values.ndim != 4 or values.shape[2] < 1 or values.shape[3] != 3:
@@ -54,5 +87,23 @@ class PositionHistoryMLP(nn.Module):
         batch_size, n_objects = values.shape[:2]
         device = next(self.parameters()).device
         tensor = torch.from_numpy(values).to(device)
-        positions = self(tensor.reshape(batch_size * n_objects, self.history_length, 3))
+
+        features = np.asarray(scene_features, dtype=np.float32)
+
+        if features.ndim != 2 or features.shape != (
+            batch_size,
+            self.scene_feature_size,
+        ):
+            raise ValueError(
+                "scene_features must have shape "
+                f"({batch_size}, {self.scene_feature_size})"
+            )
+        features = torch.from_numpy(features).to(device)
+        features = features[:, None, :].expand(batch_size, n_objects, -1)
+        features = features.reshape(batch_size * n_objects, self.scene_feature_size)
+
+        positions = self(
+            tensor.reshape(batch_size * n_objects, self.history_length, 3),
+            features,
+        )
         return positions.reshape(batch_size, n_objects, 3).cpu().numpy()

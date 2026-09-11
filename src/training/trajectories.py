@@ -25,12 +25,8 @@ class SimulationTrajectoryCollector:
         steps: int,
         n_environments: int,
         random_generator: np.random.Generator,
-    ) -> list[np.ndarray]:
-        """Collect independently randomized trajectories in one batched world.
-
-        Return one array of shape (steps + 1, 3) per environment. Each array
-        includes the ball's initial position followed by its stepped positions.
-        """
+    ) -> tuple[list[np.ndarray], np.ndarray]:
+        """Collect trajectories and their static ramp/radius features."""
         if steps < 5:
             raise ValueError("Collect at least 5 simulator steps.")
 
@@ -41,7 +37,6 @@ class SimulationTrajectoryCollector:
             random_generator=random_generator,
         )
 
-        # Each capture has shape (n_environments, 3).
         positions_by_step = [
             world.mobiles["ball"].get_pos().detach().cpu().numpy().copy()
         ]
@@ -51,21 +46,34 @@ class SimulationTrajectoryCollector:
                 world.mobiles["ball"].get_pos().detach().cpu().numpy().copy()
             )
 
-        # Stacking adds time first: (steps + 1, n_environments, 3).
         positions = np.stack(positions_by_step)
-        return [positions[:, environment_index, :] for environment_index in range(n_environments)]
+        trajectories = [
+            positions[:, environment_index, :]
+            for environment_index in range(n_environments)
+        ]
+        return trajectories, world.scene_features.astype(np.float32)
 
 
 class PositionHistoryDataset(Dataset):
     """Creates a dataset where each sample is (Features=positions across 5 sequential points in time,
      and target=position)."""
 
-    def __init__(self, positions: np.ndarray, history_length: int = 5):
+    def __init__(
+        self,
+        positions: np.ndarray,
+        history_length: int = 5,
+        *,
+        scene_features: np.ndarray,
+    ):
         positions = np.asarray(positions, dtype=np.float32)
         if positions.ndim != 2 or positions.shape[1] != 3:
             raise ValueError("positions must have shape (frames, 3)")
         if len(positions) <= history_length:
             raise ValueError("Need more frames than the history length.")
+        scene_features = np.asarray(scene_features, dtype=np.float32)
+        if scene_features.ndim != 1:
+            raise ValueError("scene_features must have shape (features,)")
+        self.scene_features = scene_features
 
         self.X = np.stack(
             [positions[i : i + history_length] for i in range(len(positions) - history_length)]
@@ -75,11 +83,12 @@ class PositionHistoryDataset(Dataset):
     def __len__(self) -> int:
         return len(self.targets)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
+        sample = (
             torch.from_numpy(self.X[index]),
             torch.from_numpy(self.targets[index]),
         )
+        return sample + (torch.from_numpy(self.scene_features),)
     
 def create_trajectory_dataset(world_builder,
                               seed, 
@@ -91,15 +100,21 @@ def create_trajectory_dataset(world_builder,
     '''
 
     random_generator = np.random.default_rng(None if seed == 0 else seed)
-    trajectories = SimulationTrajectoryCollector(world_builder).collect_randomized_batch(
+    trajectories, scene_features = SimulationTrajectoryCollector(
+        world_builder
+    ).collect_randomized_batch(
         steps,
         # 1 trajectory per environment
         n_environments=n_trajectories,
         random_generator=random_generator,
     )
     trajectory_datasets = [
-        PositionHistoryDataset(positions, required_history)
-        for positions in trajectories
+        PositionHistoryDataset(
+            positions,
+            required_history,
+            scene_features=features,
+        )
+        for positions, features in zip(trajectories, scene_features)
     ]
 
     return trajectories, ConcatDataset(trajectory_datasets)

@@ -11,7 +11,11 @@ class DummyWorldModel:
     def get_required_history(self) -> int:
         return 1
 
-    def predict(self, position_history: np.ndarray) -> np.ndarray:
+    def predict(
+        self,
+        position_history: np.ndarray,
+        scene_features: np.ndarray,
+    ) -> np.ndarray:
         """Predict a batch of all mobile positions.
 
         Args:

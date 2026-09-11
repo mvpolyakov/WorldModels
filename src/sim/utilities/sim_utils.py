@@ -16,12 +16,13 @@ class PredictionWorld:
         then step() updates both with predictions.
     """
 
-    def __init__(self, initial_mobile_positions, model):
+    def __init__(self, initial_mobile_positions, model, scene_features):
         self.model = model
         # Position tensor: BxKx3 with K mobiles.
         self.mobile_positions = np.asarray(initial_mobile_positions, dtype=float).copy()
         # history of the positions - with the time dimensions added as 3rd axis
         self.position_history = self.mobile_positions[:, :, None, :].copy()
+        self.scene_features = scene_features
 
     def needs_warm_up(self):
         """Return whether the model still needs observed history."""
@@ -39,7 +40,7 @@ class PredictionWorld:
         """Advance each predicted mobile by one model step.
 
         ``mobile_positions`` is a (B, K, 3) array containing all environments
-        and mobiles, and the model receives that array directly.
+        and mobiles. Static scene features are passed separately when present.
         
         position_history adds a T time dimension to it
 
@@ -48,7 +49,10 @@ class PredictionWorld:
 
         desired_history = self.position_history[:, :, -required_history_size:, :]
 
-        predicted_positions = self.model.predict(desired_history)
+        predicted_positions = self.model.predict(
+            desired_history,
+            self.scene_features,
+        )
 
         self.position_history = np.concatenate(
             [self.position_history, predicted_positions[:, :, None, :]],

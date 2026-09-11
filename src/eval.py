@@ -12,7 +12,7 @@ from sim.utilities.sim_utils import (
     PredictionWorld,
 )
 from sim.utilities.viz_utils import save_displacement_error_chart
-from world_models import DummyWorldModel, PositionHistoryMLP
+from world_models import DummyWorldModel, PositionHistoryMLP, SCENE_FEATURE_SIZE
 
 def get_args():
     parser = argparse.ArgumentParser(description="Build and run GRI eval.")
@@ -49,6 +49,7 @@ def main() -> None:
         model = PositionHistoryMLP(
             history_length=checkpoint["history_length"],
             hidden_size=checkpoint["hidden_size"],
+            scene_feature_size=checkpoint.get("scene_feature_size", SCENE_FEATURE_SIZE),
         )
         model.load_state_dict(checkpoint["state_dict"])
         model.to(args.device)
@@ -83,7 +84,11 @@ def main() -> None:
         ],
         axis=1,
     )
-    predicted_world = PredictionWorld(initial_mobile_positions, model)
+    predicted_world = PredictionWorld(
+        initial_mobile_positions,
+        model,
+        world.scene_features,
+    )
     displacement_error = DisplacementErrorTracker()
 
     # for now everything below (in this file) assumes predicted world exists

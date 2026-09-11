@@ -187,8 +187,8 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         self,
         random_generator: np.random.Generator,
         n_environments: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Create randomized rolling values for one or more environments."""
+    ) -> tuple:
+        """Create randomized rolling values from the scene configuration."""
 
         # Each randomized property has one value per environment: (n_environments,).
         friction_values = random_generator.uniform(0.1, 1.0, n_environments)
@@ -229,8 +229,8 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         ).astype(np.float32)
 
         distances_up_ramp = ramp_length * distance_up_ramp_fractions
-        ball_radius = self.ball_config.morph_params["radius"]
         ball_clearance = 0.01
+        ball_radius = self.ball_config.morph_params["radius"]
         distance_above_ramp_center = ramp_half_thickness + ball_radius + ball_clearance
         ball_horizontal_offsets = (
             (ramp_half_length - distances_up_ramp) * np.cos(ramp_angle_radians)
@@ -247,6 +247,29 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         ).astype(np.float32)
 
         return ramp_positions, ramp_eulers, ball_positions, friction_values
+
+    def _get_scene_features(self, world, config: SceneConfig) -> np.ndarray:
+        """Return ramp center, its first two axes, and ball radius per environment."""
+
+        ramp = world.landscape["ramp"]
+        ramp_position = ramp.get_pos().detach().cpu().numpy().astype(np.float32)
+        ramp_quaternions = ramp.get_quat().detach().cpu().numpy()
+        rotation_matrices = np.asarray(gs.utils.geom.quat_to_R(ramp_quaternions))
+        ramp_axis_x = rotation_matrices[:, :, 0].astype(np.float32)
+        ramp_axis_y = rotation_matrices[:, :, 1].astype(np.float32)
+        mobile_config = next(obj for obj in config.mobiles if obj.name == self.ball_config.name)
+        radius = np.full(
+            (ramp_position.shape[0], 1),
+            mobile_config.morph_params["radius"],
+            dtype=np.float32,
+        )
+        print('ramp axis:')
+        print(ramp_axis_x, ramp_axis_y)
+        
+        return np.concatenate(
+            [ramp_position, ramp_axis_x, ramp_axis_y, radius],
+            axis=1,
+        )
 
     def _apply_randomized_rolling_environments(
         self,
@@ -309,6 +332,10 @@ class SimpleRollingWorldBuilder(WorldBuilder):
                 random_generator,
                 n_environments,
             )
+        world.scene_features = self._get_scene_features(
+            world,
+            self.config,
+        )
         if trajectory_recorder is not None:
             trajectory_recorder.set_prediction_lateral_offset(
                 self._get_prediction_lateral_offset(world)

@@ -13,13 +13,17 @@ class ThreeFrameModel:
     def get_required_history(self):
         return 3
 
-    def predict(self, position_history):
+    def predict(self, position_history, scene_features):
         return position_history[:, :, -1, :] + 1.0
 
 
 class PredictionWorldTest(unittest.TestCase):
     def test_observations_warm_up_history_before_prediction(self):
-        predicted_world = PredictionWorld(np.zeros((1, 1, 3)), ThreeFrameModel())
+        predicted_world = PredictionWorld(
+            np.zeros((1, 1, 3)),
+            ThreeFrameModel(),
+            np.zeros((1, 10)),
+        )
 
         self.assertTrue(predicted_world.needs_warm_up())
         predicted_world.observe(np.ones((1, 1, 3)))

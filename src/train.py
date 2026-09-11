@@ -34,11 +34,13 @@ def train_model(model,
         total_loss = 0.0
         sample_count = 0
 
-        for histories, targets in data_loader:
+        for batch in data_loader:
+            histories, targets, scene_features = batch
             histories = histories.to(device)
             targets = targets.to(device)
+            scene_features = scene_features.to(device)
             optimizer.zero_grad()
-            predictions = model(histories)
+            predictions = model(histories, scene_features)
             loss = torch.mean((predictions - targets) ** 2)
             if not torch.isfinite(loss):
                 raise RuntimeError("Training loss became non-finite.")
@@ -120,12 +122,22 @@ def main() -> None:
     output_dir = Path('artifacts/runs')
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(output_dir / "trajectory.npz", positions=np.stack(trajectories))
+    np.savez(
+        output_dir / "trajectory.npz",
+        positions=np.stack(trajectories),
+        scene_features=np.stack(
+            [
+                trajectory_dataset.scene_features
+                for trajectory_dataset in dataset.datasets
+            ]
+        ),
+    )
     torch.save(
         {
             "model_type": "PositionHistoryMLP",
             "history_length": HISTORY_WINDOW,
             "hidden_size": args.hidden_size,
+            "scene_feature_size": model.scene_feature_size,
             "state_dict": model.state_dict(),
         },
         output_dir / "checkpoint.tar",
