@@ -1,6 +1,8 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import genesis as gs
 import numpy as np
@@ -37,6 +39,34 @@ class PredictionWorldTest(unittest.TestCase):
 
 
 class TrajectoryRecorderTest(unittest.TestCase):
+    def test_render_image_uses_the_stationary_camera(self):
+        stationary_camera = Mock()
+        stationary_camera.render.return_value = (
+            np.zeros((2, 2, 3)),
+            None,
+            None,
+            None,
+        )
+        trajectory_recorder = TrajectoryRecorder.__new__(TrajectoryRecorder)
+        trajectory_recorder.stationary_camera = stationary_camera
+
+        trajectory_recorder.render_image()
+
+        stationary_camera.render.assert_called_once_with(rgb=True)
+
+    def test_save_image_accepts_an_image_rendered_before_viewer_close(self):
+        trajectory_recorder = TrajectoryRecorder.__new__(TrajectoryRecorder)
+        trajectory_recorder.render_image = Mock()
+
+        with TemporaryDirectory() as temporary_directory:
+            output_path = trajectory_recorder.save_image(
+                Path(temporary_directory) / "trajectory.png",
+                np.zeros((2, 2, 3), dtype=np.uint8),
+            )
+
+            self.assertTrue(output_path.exists())
+            trajectory_recorder.render_image.assert_not_called()
+
     def test_prediction_offset_preserves_height_for_rotated_ramps(self):
         starting_positions = np.array([[[0.3, -0.2, 1.4]]])
         world_builder = SimpleRollingWorldBuilder()

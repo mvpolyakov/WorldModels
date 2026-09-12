@@ -14,12 +14,10 @@ from typing import Optional
 import genesis as gs
 import numpy as np
 
+from .cameras import correct_camera_rotation_direction, transform_cameras
 from .dataclasses import World
 from .scene_config import SceneConfig, ObjectConfig
-from .utilities.sim_utils import (
-    correct_camera_rotation_direction,
-    TrajectoryRecorder,
-)
+from .utilities.sim_utils import TrajectoryRecorder
 
 # Supported morph types mapped to their gs.morphs class
 _MORPH_MAP = {
@@ -120,8 +118,8 @@ class WorldBuilder(ABC):
         for obj in config.mobiles:
             mobile_entities[obj.name] = WorldBuilder._add_object(scene, obj)
 
-        # Observation camera
-        obs_cam = scene.add_camera(
+        # Stationary camera used to render the trajectory image.
+        stationary_camera = scene.add_camera(
             res=config.camera.obs_res,
             pos=config.camera.obs_pos,
             lookat=config.camera.obs_lookat,
@@ -135,13 +133,14 @@ class WorldBuilder(ABC):
             scene=scene,
             mobiles=mobile_entities,
             landscape=landscape_entities,
+            stationary_camera=stationary_camera,
         )
 
         if ghost_count:
             # pre generate objects for trajectory capture
             trajectory_recorder = TrajectoryRecorder(
                 scene=scene,
-                camera=obs_cam,
+                stationary_camera=stationary_camera,
                 actual_mobiles=mobile_entities,
                 actual_mobile_configs=config.mobiles,
                 predicted_mobile_configs=config.mobiles,
@@ -276,7 +275,7 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         world,
         random_generator: np.random.Generator,
         n_environments: int,
-    ) -> None:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Apply independent randomized values to a batched Genesis world."""
 
         ramp_positions, ramp_eulers, ball_positions, friction_values = (
@@ -296,6 +295,48 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         world.mobiles["ball"].set_friction_ratio(
             (friction_values / self.ball_config.friction)[:, None]
         )
+
+        return ramp_positions, ramp_eulers
+
+    def _compute_scene_transform(
+        self,
+        randomized_ramp_position: np.ndarray,
+        randomized_ramp_direction_degrees: float,
+    ) -> np.ndarray:
+        """Return the planar transform from the configured to randomized scene."""
+
+        original_center = np.asarray(
+            (*self.ramp_config.morph_params["pos"][:2], 0.0),
+            dtype=np.float32,
+        )
+        randomized_center = np.asarray(
+            (*randomized_ramp_position[:2], 0.0),
+            dtype=np.float32,
+        )
+        original_ramp_euler_degrees = self.ramp_config.morph_params.get(
+            "euler",
+            (0.0, 0.0, 0.0),
+        )
+        original_ramp_direction_degrees = original_ramp_euler_degrees[2]
+
+        yaw_change_radians = np.deg2rad(
+            randomized_ramp_direction_degrees
+            - original_ramp_direction_degrees
+        )
+        cosine = np.cos(yaw_change_radians)
+        sine = np.sin(yaw_change_radians)
+        rotation = np.array(
+            [
+                [cosine, -sine, 0.0],
+                [sine, cosine, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        scene_transform = np.eye(4, dtype=np.float32)
+        scene_transform[:3, :3] = rotation
+        scene_transform[:3, 3] = randomized_center - rotation @ original_center
+        return scene_transform
 
     def _get_prediction_lateral_offset(self, world) -> np.ndarray:
         """Return the prediction display offset perpendicular to the ramp."""
@@ -327,11 +368,16 @@ class SimpleRollingWorldBuilder(WorldBuilder):
             ghost_count=ghost_count,
         )
         if random_generator is not None:
-            self._apply_randomized_rolling_environments(
+            ramp_positions, ramp_eulers = self._apply_randomized_rolling_environments(
                 world,
                 random_generator,
                 n_environments,
             )
+            scene_transform = self._compute_scene_transform(
+                ramp_positions[0],
+                ramp_eulers[0, 2],
+            )
+            transform_cameras(world, self.config.camera, scene_transform)
         world.scene_features = self._get_scene_features(
             world,
             self.config,

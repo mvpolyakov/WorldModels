@@ -94,29 +94,6 @@ class DisplacementErrorTracker:
         return self._total_step_error
 
 
-def correct_camera_rotation_direction(viewer):
-    """Enforces expected behavior on camera rotation motion on both axes."""
-    pyrender_viewer = getattr(viewer, "_pyrender_viewer", None)
-    trackball = getattr(pyrender_viewer, "_trackball", None)
-    if trackball is None:
-        return
-
-    trackball_class = type(trackball)
-    if getattr(trackball_class, "_rotation_direction_corrected", False):
-        return
-
-    original_drag = trackball_class.drag
-
-    def drag_with_corrected_rotation(self, point):
-        if self._state == self.STATE_ROTATE:
-            point = np.asarray(point, dtype=np.float32).copy()
-            point[:2] = 2.0 * self._pdown[:2] - point[:2]
-        return original_drag(self, point)
-
-    trackball_class.drag = drag_with_corrected_rotation
-    trackball_class._rotation_direction_corrected = True
-
-
 class TrajectoryRecorder:
     """Capture translucent snapshots for actual, observed, and predicted mobiles."""
 
@@ -145,7 +122,7 @@ class TrajectoryRecorder:
     def __init__(
         self,
         scene,
-        camera,
+        stationary_camera,
         actual_mobiles,
         actual_mobile_configs,
         predicted_mobile_configs,
@@ -153,7 +130,7 @@ class TrajectoryRecorder:
     ):
         self.scene = scene
         self.actual_mobiles = actual_mobiles
-        self.camera = camera
+        self.stationary_camera = stationary_camera
         self.actual_mobile_configs = {config.name: config for config in actual_mobile_configs}
         self.predicted_mobile_configs = {config.name: config for config in predicted_mobile_configs}
         self.predicted_mobile_names = [config.name for config in predicted_mobile_configs]
@@ -209,18 +186,37 @@ class TrajectoryRecorder:
         self._next_ghost += 1
         return True
 
-    def save_image(self, path):
-        """Render the current live-viewer camera pose and save its RGB image."""
-        viewer = self.scene.viewer
-        self.camera.set_pose(pos=viewer.camera_pos, lookat=viewer.camera_lookat)
-        rendered = self.camera.render(rgb=True)
+    def render_image(self):
+        """Render the trajectory from the stationary camera.
+
+        The stationary camera is independent of interactive viewer movement,
+        so the exported trajectory view remains fixed after scene setup.
+
+        Returns:
+            RGB image as a uint8 NumPy array with shape (height, width, 3).
+        """
+        rendered = self.stationary_camera.render(rgb=True)
         rgb = rendered[0] if isinstance(rendered, tuple) else rendered
         if hasattr(rgb, "detach"):
             rgb = rgb.detach().cpu().numpy()
         if rgb.ndim == 4:
             rgb = rgb[0]
+        return rgb.astype("uint8")
 
+    def save_image(self, path, rgb_image=None):
+        """Save a trajectory image to disk.
+
+        Args:
+            path: Output path accepted by pathlib.Path.
+            rgb_image: Optional uint8 RGB array with shape (height, width, 3).
+                When omitted, the stationary camera renders the image first.
+
+        Returns:
+            Path to the saved image.
+        """
+        if rgb_image is None:
+            rgb_image = self.render_image()
         output_path = Path(path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        Image.fromarray(rgb.astype("uint8")).save(output_path)
+        Image.fromarray(rgb_image).save(output_path)
         return output_path

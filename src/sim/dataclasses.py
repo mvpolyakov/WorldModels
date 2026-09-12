@@ -12,11 +12,13 @@ class World:
         scene: gs.Scene,
         mobiles=None,
         landscape=None,
+        stationary_camera=None,
         agent=None,
     ):
         self.scene = scene
         self.mobiles = mobiles or {}
         self.landscape = landscape or {}
+        self.stationary_camera = stationary_camera
         self.agent = agent
         self.scene_features = None
         
