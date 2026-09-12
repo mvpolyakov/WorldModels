@@ -196,6 +196,11 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         ramp_direction_degrees = random_generator.uniform(-180.0, 180.0, n_environments)
         ramp_direction_radians = np.deg2rad(ramp_direction_degrees)
         distance_up_ramp_fractions = random_generator.uniform(0.55, 0.9, n_environments)
+        scene_lateral_translations = random_generator.uniform(
+            -2,
+            2,
+            (n_environments, 2),
+        )
 
         ramp_length, _, ramp_thickness = self.ramp_config.morph_params["size"]
         ramp_center_x, ramp_center_y, _ = self.ramp_config.morph_params["pos"]
@@ -214,8 +219,8 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         # Position and Euler batches have shape (n_environments, 3).
         ramp_positions = np.column_stack(
             (
-                np.full(n_environments, ramp_center_x),
-                np.full(n_environments, ramp_center_y),
+                ramp_center_x + scene_lateral_translations[:, 0],
+                ramp_center_y + scene_lateral_translations[:, 1],
                 ramp_center_z_values,
             )
         ).astype(np.float32)
@@ -237,8 +242,10 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         )
         ball_positions = np.column_stack(
             (
-                ramp_center_x + ball_horizontal_offsets * np.cos(ramp_direction_radians),
-                ramp_center_y + ball_horizontal_offsets * np.sin(ramp_direction_radians),
+                ramp_positions[:, 0]
+                + ball_horizontal_offsets * np.cos(ramp_direction_radians),
+                ramp_positions[:, 1]
+                + ball_horizontal_offsets * np.sin(ramp_direction_radians),
                 ramp_center_z_values
                 + (distances_up_ramp - ramp_half_length) * np.sin(ramp_angle_radians)
                 + distance_above_ramp_center * np.cos(ramp_angle_radians),

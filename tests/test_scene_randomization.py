@@ -6,6 +6,7 @@ import numpy as np
 
 from sim.build_world import SimpleRollingWorldBuilder
 from sim.cameras import transform_cameras
+from sim.utilities.viz_utils import draw_ground_coordinate_lines
 
 
 class SceneRandomizationTest(unittest.TestCase):
@@ -172,6 +173,34 @@ class SceneRandomizationTest(unittest.TestCase):
         transform_cameras(world, camera_config, np.eye(4, dtype=np.float32))
 
         stationary_camera.set_pose.assert_called_once()
+
+
+class CoordinateLineTest(unittest.TestCase):
+    def test_draws_different_colored_world_axes(self):
+        scene = Mock()
+        scene_config = SimpleNamespace(
+            landscape=[
+                SimpleNamespace(
+                    name="ground",
+                    morph_params={
+                        "pos": (0.0, 0.0, -0.05),
+                        "size": (8.0, 6.0, 0.1),
+                    },
+                )
+            ]
+        )
+
+        draw_ground_coordinate_lines(scene, scene_config)
+
+        self.assertEqual(scene.draw_debug_line.call_count, 2)
+        x_axis_call, y_axis_call = scene.draw_debug_line.call_args_list
+        self.assertEqual(x_axis_call.args, ((-4.0, 0.0, 0.01), (4.0, 0.0, 0.01)))
+        self.assertEqual(y_axis_call.args, ((0.0, -3.0, 0.01), (0.0, 3.0, 0.01)))
+        self.assertNotEqual(
+            x_axis_call.kwargs["color"],
+            y_axis_call.kwargs["color"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

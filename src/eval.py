@@ -11,7 +11,10 @@ from sim.utilities.sim_utils import (
     DisplacementErrorTracker,
     PredictionWorld,
 )
-from sim.utilities.viz_utils import save_displacement_error_chart
+from sim.utilities.viz_utils import (
+    draw_ground_coordinate_lines,
+    save_displacement_error_chart,
+)
 from world_models import DummyWorldModel, PositionHistoryMLP, SCENE_FEATURE_SIZE
 
 def get_args():
@@ -73,6 +76,8 @@ def main() -> None:
         random_generator=random_generator,
     )
 
+    draw_ground_coordinate_lines(world.scene, world_builder.config)
+
     add_scene_controls(world)
 
     # Set up prediction and trajectory recording
@@ -119,6 +124,17 @@ def main() -> None:
         if trajectory_recorder is not None and (step + 1) % args.ghost_interval == 0:
             trajectory_recorder.capture()
 
+    final_trajectory_image = (
+        trajectory_recorder.render_image()
+        if trajectory_recorder is not None
+        else None
+    )
+
+    # eval script is specifically for a viewer-enabled sim
+    print("Simulation finished. Close the viewer window to save artifacts and exit.")
+    while world.scene.viewer.is_alive():  # pyright: ignore
+        time.sleep(0.1)
+
     print(
         f"Final cumulative displacement error after {len(displacement_error.values)} steps: "
         f"{displacement_error.values[-1]:.6f}"
@@ -130,15 +146,13 @@ def main() -> None:
     print(f"Saved displacement error chart to {os.path.abspath(error_chart_path)}")
 
     if trajectory_recorder is not None:
-        output_path = trajectory_recorder.save_image(args.output_image)
+        output_path = trajectory_recorder.save_image(
+            args.output_image,
+            final_trajectory_image,
+        )
         print(f"Saved ball path image to {os.path.abspath(output_path)}")
 
     # save frames ??
-
-    # eval script is specifically for a viewer-enabled sim
-    print("Simulation finished. Close the viewer window to exit.")
-    while world.scene.viewer.is_alive():  # pyright: ignore
-        time.sleep(0.1)
 
 if __name__ == "__main__":
     main()
