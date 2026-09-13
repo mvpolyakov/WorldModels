@@ -295,13 +295,13 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         world.landscape["ramp"].set_pos(ramp_positions)
         world.landscape["ramp"].set_quat(gs.utils.geom.euler_to_quat(ramp_eulers))
         world.mobiles["ball"].set_pos(ball_positions, zero_velocity=True)
-        # Both entities have one link, so these batches have shape (n_environments, 1).
-        world.landscape["ramp"].set_friction_ratio(
-            (friction_values / self.ramp_config.friction)[:, None]
-        )
-        world.mobiles["ball"].set_friction_ratio(
-            (friction_values / self.ball_config.friction)[:, None]
-        )
+        # Keep the configured friction fixed so training and evaluation use the same values.
+        # world.landscape["ramp"].set_friction_ratio(
+        #     (friction_values / self.ramp_config.friction)[:, None]
+        # )
+        # world.mobiles["ball"].set_friction_ratio(
+        #     (friction_values / self.ball_config.friction)[:, None]
+        # )
 
         return ramp_positions, ramp_eulers
 
