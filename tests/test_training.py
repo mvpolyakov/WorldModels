@@ -7,7 +7,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from train import train_model
-from training.trajectories import create_trajectory_dataset
+from training.trajectories import PositionHistoryDataset, create_trajectory_dataset
 
 
 class ConstantPositionModel(nn.Module):
@@ -19,10 +19,19 @@ class ConstantPositionModel(nn.Module):
         return self.position.expand(len(histories), -1)
 
 
+class IncrementingPositionModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.offset = nn.Parameter(torch.ones(3))
+
+    def forward(self, histories, scene_features):
+        return histories[:, -1] + self.offset
+
+
 class TrainingTest(unittest.TestCase):
     def test_create_trajectory_dataset_splits_trajectories_80_20(self):
         trajectories = [
-            np.full((7, 3), trajectory_index, dtype=np.float32)
+            np.full((10, 3), trajectory_index, dtype=np.float32)
             for trajectory_index in range(10)
         ]
         scene_features = np.stack(
@@ -54,11 +63,29 @@ class TrainingTest(unittest.TestCase):
             scene_features[8],
         )
 
+    def test_position_history_dataset_returns_five_future_frames(self):
+        positions = np.arange(36, dtype=np.float32).reshape(12, 3)
+        dataset = PositionHistoryDataset(
+            positions,
+            history_length=5,
+            prediction_horizon=5,
+            scene_features=np.zeros(10, dtype=np.float32),
+        )
+
+        self.assertEqual(len(dataset), 3)
+        np.testing.assert_array_equal(dataset[0][0], positions[:5])
+        np.testing.assert_array_equal(dataset[0][1], positions[5:10])
+        np.testing.assert_array_equal(dataset[2][1], positions[7:12])
+
     def test_train_model_records_training_and_validation_errors(self):
         histories = torch.zeros((3, 1, 3))
         scene_features = torch.zeros((3, 1))
-        training_targets = torch.tensor([[1.0] * 3, [3.0] * 3, [5.0] * 3])
-        validation_targets = torch.tensor([[2.0] * 3, [4.0] * 3, [6.0] * 3])
+        training_targets = torch.tensor(
+            [[[1.0] * 3] * 5, [[3.0] * 3] * 5, [[5.0] * 3] * 5]
+        )
+        validation_targets = torch.tensor(
+            [[[2.0] * 3] * 5, [[4.0] * 3] * 5, [[6.0] * 3] * 5]
+        )
         training_loader = DataLoader(
             TensorDataset(histories, training_targets, scene_features),
             batch_size=2,
@@ -78,6 +105,26 @@ class TrainingTest(unittest.TestCase):
 
         self.assertAlmostEqual(training_errors[0], 35.0 / 3.0)
         self.assertAlmostEqual(validation_errors[0], 56.0 / 3.0)
+
+    def test_train_model_feeds_predictions_back_into_rollout(self):
+        histories = torch.zeros((1, 2, 3))
+        targets = torch.zeros((1, 5, 3))
+        scene_features = torch.zeros((1, 1))
+        data_loader = DataLoader(
+            TensorDataset(histories, targets, scene_features),
+            batch_size=1,
+        )
+
+        training_errors, validation_errors = train_model(
+            IncrementingPositionModel(),
+            data_loader,
+            data_loader,
+            {"lr": 0.0, "epochs": 1},
+            torch.device("cpu"),
+        )
+
+        self.assertAlmostEqual(training_errors[0], 11.0)
+        self.assertAlmostEqual(validation_errors[0], 11.0)
 
 
 if __name__ == "__main__":

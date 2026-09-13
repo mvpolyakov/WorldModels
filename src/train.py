@@ -18,6 +18,7 @@ from training import (
 from world_models import PositionHistoryMLP
 
 HISTORY_WINDOW = 5
+PREDICTION_HORIZON = 5
 
 def _process_epoch_pass(model, data_loader, device, optimizer):
     total_loss = 0.0
@@ -31,7 +32,18 @@ def _process_epoch_pass(model, data_loader, device, optimizer):
         if optimizer is not None:
             optimizer.zero_grad()
 
-        predictions = model(histories, scene_features)
+        # Predict multiple steps into the future progressively adding predictions into
+        # history for more informative loss calc
+        predictions = []
+        rollout_history = histories
+        for _ in range(targets.shape[1]):
+            predicted_position = model(rollout_history, scene_features)
+            predictions.append(predicted_position)
+            rollout_history = torch.cat(
+                [rollout_history[:, 1:], predicted_position.unsqueeze(1)],
+                dim=1,
+            )
+        predictions = torch.stack(predictions, dim=1)
         loss = torch.mean((predictions - targets) ** 2)
         if not torch.isfinite(loss):
             error = ('Validation' if optimizer is None else 'Training') + "loss became non-finite."
@@ -125,6 +137,7 @@ def main() -> None:
         args.steps,
         args.trajectories,
         HISTORY_WINDOW,
+        PREDICTION_HORIZON,
     )
 
     # Genesis sets PyTorch's default device to its backend during initialization.
@@ -175,6 +188,7 @@ def main() -> None:
         {
             "model_type": "PositionHistoryMLP",
             "history_length": HISTORY_WINDOW,
+            "prediction_horizon": PREDICTION_HORIZON,
             "hidden_size": args.hidden_size,
             "scene_feature_size": model.scene_feature_size,
             "state_dict": model.state_dict(),

@@ -55,30 +55,36 @@ class SimulationTrajectoryCollector:
 
 
 class PositionHistoryDataset(Dataset):
-    """Creates a dataset where each sample is (Features=positions across 5 sequential points in time,
-     and target=position)."""
+    """Create position histories and their subsequent rollout targets."""
 
     def __init__(
         self,
         positions: np.ndarray,
         history_length: int = 5,
+        prediction_horizon: int = 5,
         *,
         scene_features: np.ndarray,
     ):
         positions = np.asarray(positions, dtype=np.float32)
         if positions.ndim != 2 or positions.shape[1] != 3:
             raise ValueError("positions must have shape (frames, 3)")
-        if len(positions) <= history_length:
-            raise ValueError("Need more frames than the history length.")
+        if len(positions) < history_length + prediction_horizon:
+            raise ValueError("Need enough frames for the history and prediction horizon.")
         scene_features = np.asarray(scene_features, dtype=np.float32)
         if scene_features.ndim != 1:
             raise ValueError("scene_features must have shape (features,)")
         self.scene_features = scene_features
 
+        sample_count = len(positions) - history_length - prediction_horizon + 1
         self.X = np.stack(
-            [positions[i : i + history_length] for i in range(len(positions) - history_length)]
+            [positions[i : i + history_length] for i in range(sample_count)]
         )
-        self.targets = positions[history_length:]
+        self.targets = np.stack(
+            [
+                positions[i + history_length : i + history_length + prediction_horizon]
+                for i in range(sample_count)
+            ]
+        )
 
     def __len__(self) -> int:
         return len(self.targets)
@@ -94,7 +100,8 @@ def create_trajectory_dataset(world_builder,
                               seed, 
                               steps,
                               n_trajectories,
-                              required_history):
+                              required_history,
+                              prediction_horizon=5):
     '''
     create n_trajectories randomized rollouts for teaching a model basic rolling physics
     '''
@@ -118,6 +125,7 @@ def create_trajectory_dataset(world_builder,
         PositionHistoryDataset(
             positions,
             required_history,
+            prediction_horizon,
             scene_features=features,
         )
         for positions, features in zip(
@@ -129,6 +137,7 @@ def create_trajectory_dataset(world_builder,
         PositionHistoryDataset(
             positions,
             required_history,
+            prediction_horizon,
             scene_features=features,
         )
         for positions, features in zip(
