@@ -101,6 +101,7 @@ class PositionHistoryDataset(Dataset):
         scene_features = np.asarray(scene_features, dtype=np.float32)
         if scene_features.ndim != 1:
             raise ValueError("scene_features must have shape (features,)")
+        self.positions = positions
         self.scene_features = scene_features
 
         sample_count = len(positions) - history_length - prediction_horizon + 1

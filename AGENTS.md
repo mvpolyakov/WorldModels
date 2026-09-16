@@ -46,7 +46,7 @@
 
 - The primary language is Python.
 - For analysis code, use pandas for data manipulation and matplotlib or seaborn for visualization unless instructed otherwise.
-- Before running Python from the command line, activate the main Python environment with `pyenv activate cuda`.
+- Before running Python from the command line, activate the main Python environment with `pyenv activate ai`.
 
 ## Python Coding Standards
 
