@@ -172,9 +172,18 @@ def main() -> None:
     output_dir = Path('artifacts/runs')
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    trajectory_lengths = np.asarray([len(trajectory) for trajectory in trajectories])
+    saved_positions = np.full(
+        (len(trajectories), trajectory_lengths.max(), 3),
+        np.nan,
+        dtype=np.float32,
+    )
+    for trajectory_index, trajectory in enumerate(trajectories):
+        saved_positions[trajectory_index, :len(trajectory)] = trajectory
     np.savez(
         output_dir / "trajectory.npz",
-        positions=np.stack(trajectories),
+        positions=saved_positions,
+        trajectory_lengths=trajectory_lengths,
         scene_features=np.stack(
             [
                 trajectory_dataset.scene_features

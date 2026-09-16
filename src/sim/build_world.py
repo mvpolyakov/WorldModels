@@ -269,8 +269,6 @@ class SimpleRollingWorldBuilder(WorldBuilder):
             mobile_config.morph_params["radius"],
             dtype=np.float32,
         )
-        print('ramp axis:')
-        print(ramp_axis_x, ramp_axis_y)
         
         return np.concatenate(
             [ramp_position, ramp_axis_x, ramp_axis_y, radius],

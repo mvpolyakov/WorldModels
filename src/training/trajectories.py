@@ -7,6 +7,8 @@ from torch.utils.data import Dataset, ConcatDataset, DataLoader
 
 from sim.build_world import WorldBuilder
 
+#MIN_MOVEMENT = 0.001 # min object displacement to keep collecting trajectory
+MIN_MOVEMENT = 0 # actually do want to have samples of near static objects - this pretty much eliminates it
 
 class SimulationTrajectoryCollector:
     """Collect ball-position trajectories from a batched Genesis world.
@@ -40,15 +42,41 @@ class SimulationTrajectoryCollector:
         positions_by_step = [
             world.mobiles["ball"].get_pos().detach().cpu().numpy().copy()
         ]
+
+        stationary_frame_counts = np.zeros(n_environments, dtype=np.int32)
+        trajectory_end_indices = np.full(n_environments, -1, dtype=np.int32)
+
         for _ in range(steps):
             world.step()
-            positions_by_step.append(
+
+            # All of this just keeps track of when each individual trajectory seizes substantial movement for an early cutoff 
+            # (don't want a bunch of samples of essentially stationary objects)
+
+            current_positions = (
                 world.mobiles["ball"].get_pos().detach().cpu().numpy().copy()
             )
+            displacements = np.linalg.norm(
+                current_positions - positions_by_step[-1],
+                axis=1,
+            )
+            stationary_frame_counts = np.where(
+                displacements < MIN_MOVEMENT,
+                stationary_frame_counts + 1,
+                0,
+            )
+            positions_by_step.append(current_positions)
+            newly_stationary = (
+                (stationary_frame_counts >= 5) & (trajectory_end_indices < 0)
+            )
+            trajectory_end_indices[newly_stationary] = len(positions_by_step)
 
         positions = np.stack(positions_by_step)
+
+        # have to collect all trajectories fully but then cut off individual trajectories where movement is too small 
+        # they will be seamlessly combined regardless of length in the dataset collection later
+        trajectory_end_indices[trajectory_end_indices < 0] = len(positions_by_step)
         trajectories = [
-            positions[:, environment_index, :]
+            positions[:trajectory_end_indices[environment_index], environment_index, :]
             for environment_index in range(n_environments)
         ]
         return trajectories, world.scene_features.astype(np.float32)

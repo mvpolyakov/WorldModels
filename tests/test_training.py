@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -7,7 +8,11 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from train import train_model
-from training.trajectories import PositionHistoryDataset, create_trajectory_dataset
+from training.trajectories import (
+    PositionHistoryDataset,
+    SimulationTrajectoryCollector,
+    create_trajectory_dataset,
+)
 
 
 class ConstantPositionModel(nn.Module):
@@ -29,6 +34,57 @@ class IncrementingPositionModel(nn.Module):
 
 
 class TrainingTest(unittest.TestCase):
+    def test_trajectory_collection_culls_each_trajectory_when_stationary(self):
+        second_trajectory_positions = [
+            0.0,
+            0.002,
+            0.004,
+            0.0045,
+            0.005,
+            0.0055,
+            0.006,
+            0.0065,
+        ]
+        positions = [
+            torch.tensor(
+                [
+                    [step * 0.0005, 0.0, 0.0],
+                    [second_trajectory_positions[step], 0.0, 0.0],
+                ]
+            )
+            for step in range(8)
+        ]
+        position_index = 0
+
+        ball = SimpleNamespace(get_pos=lambda: positions[position_index])
+        world = SimpleNamespace(
+            mobiles={"ball": ball},
+            scene_features=np.zeros((2, 10)),
+        )
+
+        def step_world():
+            nonlocal position_index
+            position_index += 1
+
+        world.step = step_world
+        world_builder = SimpleNamespace(
+            config=SimpleNamespace(mobiles=[object()]),
+            build=lambda **_: (world, None),
+        )
+
+        with patch("builtins.print") as print_mock:
+            trajectories, _ = SimulationTrajectoryCollector(
+                world_builder
+            ).collect_randomized_batch(
+                steps=20,
+                n_environments=2,
+                random_generator=np.random.default_rng(1),
+            )
+
+        self.assertEqual(len(trajectories[0]), 6)
+        self.assertEqual(len(trajectories[1]), 8)
+        print_mock.assert_called_once()
+
     def test_create_trajectory_dataset_splits_trajectories_80_20(self):
         trajectories = [
             np.full((10, 3), trajectory_index, dtype=np.float32)
