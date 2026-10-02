@@ -27,11 +27,11 @@ class PredictionWorldTest(unittest.TestCase):
             np.zeros((1, 10)),
         )
 
-        self.assertTrue(predicted_world.needs_warm_up())
+        self.assertTrue(predicted_world.needs_more_warm_up())
         predicted_world.observe(np.ones((1, 1, 3)))
-        self.assertTrue(predicted_world.needs_warm_up())
+        self.assertTrue(predicted_world.needs_more_warm_up())
         predicted_world.observe(np.full((1, 1, 3), 2.0))
-        self.assertFalse(predicted_world.needs_warm_up())
+        self.assertFalse(predicted_world.needs_more_warm_up())
 
         predicted_world.step()
 

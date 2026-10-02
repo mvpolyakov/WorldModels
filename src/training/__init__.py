@@ -3,12 +3,15 @@
 from .trajectories import (
     PositionHistoryDataset,
     SimulationTrajectoryCollector,
-    create_trajectory_dataset
-    ,
+    TrajectorySequenceDataset,
+    create_trajectory_dataset,
+    create_trajectory_sequence_dataset,
 )
 
 __all__ = [
     "PositionHistoryDataset",
     "SimulationTrajectoryCollector",
+    "TrajectorySequenceDataset",
     "create_trajectory_dataset",
+    "create_trajectory_sequence_dataset",
 ]

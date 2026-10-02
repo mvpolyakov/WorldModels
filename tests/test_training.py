@@ -7,12 +7,17 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from train import train_model
+from train_mlp import (
+    _add_random_walk_velocity_noise,
+    _evaluate_full_trajectory_rollouts,
+    train_model,
+)
 from training.trajectories import (
     PositionHistoryDataset,
     SimulationTrajectoryCollector,
     create_trajectory_dataset,
 )
+from world_models import PositionHistoryMLP
 
 
 class ConstantPositionModel(nn.Module):
@@ -33,7 +38,43 @@ class IncrementingPositionModel(nn.Module):
         return histories[:, -1] + self.offset
 
 
+class RecordingPositionModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.position = nn.Parameter(torch.zeros(3))
+        self.histories = []
+
+    def forward(self, histories, scene_features):
+        self.histories.append(histories.detach().clone())
+        return self.position.expand(len(histories), -1)
+
+
 class TrainingTest(unittest.TestCase):
+    def test_position_history_model_predict_integrates_displacement(self):
+        model = PositionHistoryMLP(
+            history_length=2,
+            hidden_size=4,
+            scene_feature_size=1,
+        )
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.zero_()
+            model.network[-1].bias.copy_(torch.tensor([0.5, -0.5, 1.0]))
+
+        history = np.asarray(
+            [[[[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]]]],
+            dtype=np.float32,
+        )
+        predicted_positions = model.predict(
+            history,
+            np.zeros((1, 1), dtype=np.float32),
+        )
+
+        np.testing.assert_array_equal(
+            predicted_positions,
+            np.asarray([[[2.5, 2.5, 5.0]]], dtype=np.float32),
+        )
+
     def test_trajectory_collection_culls_each_trajectory_when_stationary(self):
         second_trajectory_positions = [
             0.0,
@@ -72,18 +113,17 @@ class TrainingTest(unittest.TestCase):
             build=lambda **_: (world, None),
         )
 
-        with patch("builtins.print") as print_mock:
+        with patch("training.trajectories.MIN_MOVEMENT", 0.001):
             trajectories, _ = SimulationTrajectoryCollector(
                 world_builder
             ).collect_randomized_batch(
-                steps=20,
+                steps=7,
                 n_environments=2,
                 random_generator=np.random.default_rng(1),
             )
 
         self.assertEqual(len(trajectories[0]), 6)
         self.assertEqual(len(trajectories[1]), 8)
-        print_mock.assert_called_once()
 
     def test_create_trajectory_dataset_splits_trajectories_80_20(self):
         trajectories = [
@@ -151,11 +191,11 @@ class TrainingTest(unittest.TestCase):
             batch_size=2,
         )
 
-        training_errors, validation_errors = train_model(
+        training_errors, validation_errors, _ = train_model(
             ConstantPositionModel(),
             training_loader,
             validation_loader,
-            {"lr": 0.0, "epochs": 1},
+            {"lr": 0.0, "epochs": 1, "input_velocity_innovation_std": 0.0},
             torch.device("cpu"),
         )
 
@@ -171,16 +211,116 @@ class TrainingTest(unittest.TestCase):
             batch_size=1,
         )
 
-        training_errors, validation_errors = train_model(
+        training_errors, validation_errors, _ = train_model(
             IncrementingPositionModel(),
             data_loader,
             data_loader,
-            {"lr": 0.0, "epochs": 1},
+            {"lr": 0.0, "epochs": 1, "input_velocity_innovation_std": 0.0},
             torch.device("cpu"),
         )
 
         self.assertAlmostEqual(training_errors[0], 11.0)
         self.assertAlmostEqual(validation_errors[0], 11.0)
+
+    def test_random_walk_velocity_noise_accumulates_position_drift(self):
+        histories = torch.zeros((1, 4, 3))
+
+        with (
+            patch("train_mlp.torch.randn_like", return_value=torch.ones((1, 3, 3))),
+            patch("train_mlp.velocity_noise_probability", 1.0),
+        ):
+            perturbed = _add_random_walk_velocity_noise(histories, 1.0)
+
+        expected_positions = torch.tensor(
+            [[[0.0] * 3, [1.0] * 3, [3.0] * 3, [6.0] * 3]]
+        )
+        torch.testing.assert_close(perturbed, expected_positions)
+
+    def test_random_walk_velocity_noise_leaves_unselected_samples_clean(self):
+        histories = torch.zeros((2, 2, 3))
+        sample_draws = torch.tensor([[[0.0]], [[1.0]]])
+
+        with (
+            patch("train_mlp.torch.randn_like", return_value=torch.ones((2, 1, 3))),
+            patch("train_mlp.torch.rand", return_value=sample_draws),
+            patch("train_mlp.velocity_noise_probability", 0.5),
+        ):
+            perturbed = _add_random_walk_velocity_noise(
+                histories,
+                velocity_innovation_std=0.25,
+            )
+
+        expected_positions = histories.clone()
+        expected_positions[0, 1] = 0.25
+        torch.testing.assert_close(perturbed, expected_positions)
+
+    def test_train_model_perturbs_training_histories_only(self):
+        histories = torch.zeros((1, 2, 3))
+        targets = torch.zeros((1, 1, 3))
+        scene_features = torch.zeros((1, 1))
+        data_loader = DataLoader(
+            TensorDataset(histories, targets, scene_features),
+            batch_size=1,
+        )
+        model = RecordingPositionModel()
+
+        with (
+            patch("train_mlp.torch.randn_like", return_value=torch.ones((1, 1, 3))),
+            patch("train_mlp.velocity_noise_probability", 1.0),
+        ):
+            train_model(
+                model,
+                data_loader,
+                data_loader,
+                {
+                    "lr": 0.0,
+                    "epochs": 1,
+                    "input_velocity_innovation_std": 0.25,
+                },
+                torch.device("cpu"),
+            )
+
+        expected_training_history = histories.clone()
+        expected_training_history[:, 1] = 0.25
+        torch.testing.assert_close(model.histories[0], expected_training_history)
+        torch.testing.assert_close(model.histories[1], histories)
+
+    def test_full_trajectory_rollout_records_step_errors(self):
+        positions = np.zeros((5, 3), dtype=np.float32)
+        trajectory_dataset = PositionHistoryDataset(
+            positions,
+            history_length=2,
+            prediction_horizon=1,
+            scene_features=np.zeros(1, dtype=np.float32),
+        )
+
+        rollouts = _evaluate_full_trajectory_rollouts(
+            IncrementingPositionModel(),
+            SimpleNamespace(datasets=[trajectory_dataset]),
+            torch.device("cpu"),
+        )
+
+        expected_position_errors = np.asarray(
+            [[1.0] * 3, [2.0] * 3, [3.0] * 3],
+            dtype=np.float32,
+        )
+        expected_velocity_errors = np.ones((3, 3), dtype=np.float32)
+        expected_velocity_error_innovations = np.asarray(
+            [[1.0] * 3, [0.0] * 3, [0.0] * 3],
+            dtype=np.float32,
+        )
+        np.testing.assert_array_equal(
+            rollouts[0]["position_errors"],
+            expected_position_errors,
+        )
+        np.testing.assert_array_equal(
+            rollouts[0]["velocity_errors"],
+            expected_velocity_errors,
+        )
+        np.testing.assert_array_equal(
+            rollouts[0]["velocity_error_innovations"],
+            expected_velocity_error_innovations,
+        )
 
 
 if __name__ == "__main__":

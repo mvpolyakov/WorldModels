@@ -35,7 +35,7 @@ def draw_ground_coordinate_lines(scene, scene_config: SceneConfig) -> None:
 
 
 def save_displacement_error_chart(error_values, path):
-    """Save cumulative summed displacement error as a PNG line chart."""
+    """Save cumulative summed XY displacement error as a PNG line chart."""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -44,8 +44,8 @@ def save_displacement_error_chart(error_values, path):
     axes = figure.subplots()
     axes.plot(range(1, len(error_values) + 1), error_values)
     axes.set_xlabel("Simulation step")
-    axes.set_ylabel("Cumulative displacement error (distance × steps)")
-    axes.set_title("Cumulative Displacement Error")
+    axes.set_ylabel("Cumulative XY displacement error (distance × steps)")
+    axes.set_title("Cumulative XY Displacement Error")
     axes.grid(alpha=0.3)
     figure.tight_layout()
     figure.savefig(output_path, dpi=150)

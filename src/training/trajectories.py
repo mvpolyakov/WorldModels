@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, ConcatDataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import ConcatDataset, Dataset
 
 
 from sim.build_world import WorldBuilder
@@ -124,7 +125,95 @@ class PositionHistoryDataset(Dataset):
             torch.from_numpy(self.targets[index]),
         )
         return sample + (torch.from_numpy(self.scene_features),)
-    
+
+
+class TrajectorySequenceDataset(Dataset):
+    """Expose each complete trajectory as one latent-state training sample.
+
+    Pad positions once to the longest trajectory in this dataset so the standard
+    DataLoader can stack samples. N is trajectory count, T is the maximum frame
+    count, and F is scene-feature width.
+
+    @param trajectories: List of float arrays shaped (T_i, 3), where T_i is
+        each trajectory's original frame count.
+    @param scene_features: Float array shaped (N, F), one row per trajectory.
+    """
+
+    def __init__(
+        self,
+        trajectories: list[np.ndarray],
+        scene_features: np.ndarray,
+    ):
+        """Validate trajectories and prepare padded CPU tensors.
+
+        Pads all trajectories in the dataset to same length (max).
+        Dataset-wide padding keeps batching simple, but costs storage and network
+        computation for the extra padding in every batch; masking only removes its losses.
+        If lengths vary substantially, an alternative is to keep variable-length
+        tensors and use a custom collate function to pad each batch to its own
+        longest trajectory.
+        """
+        if len(trajectories) == 0:
+            raise ValueError("At least one trajectory is required.")
+        
+        #features = np.asarray(scene_features, dtype=np.float32)
+        if scene_features.ndim != 2 or len(scene_features) != len(trajectories):
+            raise ValueError(
+                "scene_features must have shape (trajectories, features)"
+            )
+
+        self.trajectories = []
+        for trajectory in trajectories:
+            #trajectory = np.asarray(trajectory, dtype=np.float32) declared as such
+            if trajectory.ndim != 2 or trajectory.shape[1] != 3:
+                raise ValueError("Each trajectory must have shape (frames, 3)")
+            if len(trajectory) == 0:
+                raise ValueError("Trajectories must contain at least one frame.")
+            self.trajectories.append(trajectory)
+
+        # Retain unpadded arrays for rollout evaluation and artifact export.
+        self.padded_positions = pad_sequence(
+            [torch.from_numpy(trajectory) for trajectory in self.trajectories],
+            batch_first=True,
+        )
+        
+        # keep data on cpu and move to device on each batch processing step
+        # with large data this is a requirement with small (here) not much gain from alternative
+        self.scene_feature_tensor = torch.from_numpy(scene_features)
+
+        # Dataset creation can follow Genesis initialization, which changes the
+        # default device. Keep stored data and masks on CPU until training.
+        self.trajectory_lengths = torch.tensor(
+            [len(trajectory) for trajectory in self.trajectories],
+            dtype=torch.long,
+            device="cpu",
+        )
+        frame_indices = torch.arange(self.padded_positions.shape[1], device="cpu")
+        self.padding_frame_mask = (
+            frame_indices.unsqueeze(0) >= self.trajectory_lengths.unsqueeze(1)
+        )
+
+    def __len__(self) -> int:
+        """Return the number of complete trajectories."""
+        return len(self.trajectories)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
+        """Return a padded trajectory and its original length for batching.
+
+        @param index: Trajectory index.
+
+        @return: Positions (T, 3), scene features (F,), scalar trajectory length,
+            and padding_frame_mask (T,). True marks trailing padding and False
+            marks an observation; T is the dataset's maximum trajectory length.
+        """
+        return (
+            self.padded_positions[index],
+            self.scene_feature_tensor[index],
+            self.trajectory_lengths[index],
+            self.padding_frame_mask[index],
+        )
+
+
 def create_trajectory_dataset(world_builder,
                               seed, 
                               steps,
@@ -180,3 +269,47 @@ def create_trajectory_dataset(world_builder,
         ConcatDataset(training_trajectory_datasets),
         ConcatDataset(validation_trajectory_datasets),
     )
+
+
+def create_trajectory_sequence_dataset(
+    world_builder,
+    seed,
+    steps,
+    n_trajectories,
+):
+    """Collect simulator trajectories and split them without splitting sequences.
+
+    20 percent of trajectories (at least one), are reserved for
+    validation. Each split pads its trajectories once to its own maximum length.
+
+    @param world_builder: Builder used to create the randomized simulation batch.
+    @param seed: Randomization seed; zero requests nondeterministic collection.
+    @param steps: Maximum simulator steps collected per trajectory.
+    @param n_trajectories: Number of randomized environments to collect.
+
+    @return: All raw position arrays, the training TrajectorySequenceDataset,
+        and the validation TrajectorySequenceDataset.
+    """
+    if n_trajectories < 2:
+        raise ValueError("At least 2 trajectories are required for training and validation.")
+
+    random_generator = np.random.default_rng(None if seed == 0 else seed)
+    trajectories, scene_features = SimulationTrajectoryCollector(
+        world_builder
+    ).collect_randomized_batch(
+        steps,
+        n_environments=n_trajectories,
+        random_generator=random_generator,
+    )
+    validation_trajectory_count = max(1, n_trajectories // 5)
+    training_trajectory_count = n_trajectories - validation_trajectory_count
+
+    training_dataset = TrajectorySequenceDataset(
+        trajectories[:training_trajectory_count],
+        scene_features[:training_trajectory_count],
+    )
+    validation_dataset = TrajectorySequenceDataset(
+        trajectories[training_trajectory_count:],
+        scene_features[training_trajectory_count:],
+    )
+    return trajectories, training_dataset, validation_dataset

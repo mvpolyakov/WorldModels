@@ -15,7 +15,49 @@ from sim.utilities.viz_utils import (
     draw_ground_coordinate_lines,
     save_displacement_error_chart,
 )
-from world_models import DummyWorldModel, PositionHistoryMLP, SCENE_FEATURE_SIZE
+from world_models import (
+    DummyWorldModel,
+    LatentStateModel,
+    PositionHistoryMLP,
+    SCENE_FEATURE_SIZE,
+)
+
+
+def _load_checkpoint_model(checkpoint, device):
+    """Construct the recorded model class and load its parameter tensors.
+
+    @param checkpoint: Checkpoint dictionary containing model_type, constructor
+        dimensions, and state_dict.
+    @param device: Torch device receiving the reconstructed model.
+
+    @return: Model in evaluation mode with checkpoint parameters loaded.
+    """
+    if checkpoint.get("model_type") == "PositionHistoryMLP":
+        model = PositionHistoryMLP(
+            history_length=checkpoint["history_length"],
+            hidden_size=checkpoint["hidden_size"],
+            scene_feature_size=checkpoint.get(
+                "scene_feature_size",
+                SCENE_FEATURE_SIZE,
+            ),
+        )
+    elif checkpoint.get("model_type") == "LatentStateModel":
+        model = LatentStateModel(
+            latent_size=checkpoint["latent_size"],
+            observation_embedding_size=checkpoint.get(
+                "observation_embedding_size", checkpoint["latent_size"]
+            ),
+            hidden_size=checkpoint["hidden_size"],
+            scene_feature_size=checkpoint.get(
+                "scene_feature_size",
+                SCENE_FEATURE_SIZE,
+            ),
+            warm_up_length=checkpoint["warm_up_length"],
+        )
+    model.load_state_dict(checkpoint["state_dict"])
+    model.to(device)
+    model.eval()
+    return model
 
 def get_args():
     parser = argparse.ArgumentParser(description="Build and run GRI eval.")
@@ -49,14 +91,7 @@ def main() -> None:
     else:
         print('loading ', args.model)
         checkpoint = torch.load(args.model, map_location=args.device)
-        model = PositionHistoryMLP(
-            history_length=checkpoint["history_length"],
-            hidden_size=checkpoint["hidden_size"],
-            scene_feature_size=checkpoint.get("scene_feature_size", SCENE_FEATURE_SIZE),
-        )
-        model.load_state_dict(checkpoint["state_dict"])
-        model.to(args.device)
-        model.eval()
+        model = _load_checkpoint_model(checkpoint, args.device)
 
     # Create world
 
@@ -112,7 +147,7 @@ def main() -> None:
             axis=1,
         )
 
-        if predicted_world.needs_warm_up():
+        if predicted_world.needs_more_warm_up():
             predicted_world.observe(actual_positions)
             if (step + 1) % args.ghost_interval == 0:
                 trajectory_recorder.capture_observation(actual_positions)
@@ -136,7 +171,8 @@ def main() -> None:
         time.sleep(0.1)
 
     print(
-        f"Final cumulative displacement error after {len(displacement_error.values)} steps: "
+        f"Final cumulative XY displacement error after "
+        f"{len(displacement_error.values)} steps: "
         f"{displacement_error.values[-1]:.6f}"
     )
     error_chart_path = save_displacement_error_chart(

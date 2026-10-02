@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import json
 import random
@@ -7,121 +5,372 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import DataLoader
 
 from sim.build_world import load_world_builder
-from training import (
-    PositionHistoryDataset,
-    SimulationTrajectoryCollector,
-    create_trajectory_dataset
-)
-from world_models import PositionHistoryMLP
+from training.trajectories import create_trajectory_sequence_dataset
+from world_models import LatentStateModel
 
-HISTORY_WINDOW = 5
+WARMUP_LENGTH = 3  # Min 2 frames for change detection since includes the frame from which we predict; three for acceleration.
 PREDICTION_HORIZON = 5
-velocity_noise_probability = 0.75
 
-def _add_random_walk_velocity_noise(
-    histories,
-    velocity_innovation_std,
-):
-    interval_count = histories.shape[1] - 1
-    if (
-        velocity_innovation_std == 0.0
-        or velocity_noise_probability == 0.0
-        or interval_count == 0
-    ):
-        return histories
 
-    velocity_innovations = torch.randn_like(histories[:, 1:])
-    velocity_innovations *= velocity_innovation_std
-    velocity_noise = torch.cumsum(velocity_innovations, dim=1)
-    position_noise = torch.cumsum(velocity_noise, dim=1)
-    position_noise = torch.cat(
-        [torch.zeros_like(histories[:, :1]), position_noise],
-        dim=1,
+def _compute_observation_states(
+    model: LatentStateModel,
+    observed_positions: torch.Tensor,
+    scene_features: torch.Tensor,
+    padding_frame_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Traverse observations chronologically, retaining state across padded frames.
+
+    B is trajectory count, T is padded frame count, L is latent width, and F is
+    scene-feature width. Gradients remain connected through the entire sequence.
+
+    @param observed_positions: XYZ observations (B, T, 3), with finite padding.
+    @param scene_features: Static scene features (B, F).
+    @param padding_frame_mask: Boolean tensor (B, T); True marks trailing padding.
+
+    @return: Observation-updated states (B, T, L). Padded entries repeat the
+        trajectory's last observed state and are excluded from losses.
+    """
+    current_state = model.initialize_state(
+        observed_positions.shape[0],
+        device=observed_positions.device,
+        dtype=observed_positions.dtype,
     )
-    if velocity_noise_probability < 1.0:
-        noisy_samples = torch.rand(
-            (histories.shape[0], 1, 1),
-            device=histories.device,
-        ) < velocity_noise_probability
-        position_noise *= noisy_samples
-    return histories + position_noise
+    observation_states = []
+    # step through each frame of the trajectories - whole batch at once - 
+    for frame_index in range(observed_positions.shape[1]):
+        # The first observation initializes state at its own time; later frames
+        # require one transition before incorporating the new observation.
+        prior_state = current_state if frame_index == 0 else model.predict_state(current_state)
+        
+        observation_embedding = model.encode_observation(
+            observed_positions[:, frame_index], scene_features
+        )
+        updated_state = model.update_state(prior_state, observation_embedding)
+        current_state = torch.where(
+            padding_frame_mask[:, frame_index].unsqueeze(-1),
+            current_state,
+            updated_state,
+        )
+        observation_states.append(current_state)
+
+    return torch.stack(observation_states, dim=1)
+
+def _compute_consistency_error_sum(
+    predicted_states: torch.Tensor,
+    observation_states: torch.Tensor,
+    padding_frame_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Score predicted latents against detached observation-informed targets.
+
+    B is trajectory count and L is latent width. Only this use of the target is
+    detached; reconstruction and future forecasts can still train its encoder.
+
+    @param predicted_states: Autonomous predictions (B, L).
+    @param observation_states: Observation-updated targets at the same time (B, L).
+    @param padding_frame_mask: Boolean tensor (B,); True excludes a trajectory.
+
+    @return: Scalar sum of squared latent errors over non-padding entries.
+    """
+    return torch.sum(
+        (predicted_states - observation_states.detach()) ** 2
+        * (~padding_frame_mask).unsqueeze(-1)
+    )
+
+def _compute_batch_losses(
+    model: LatentStateModel,
+    observed_positions: torch.Tensor,
+    scene_features: torch.Tensor,
+    padding_frame_mask: torch.Tensor,
+):
+    """Compute reconstruction and autonomous forecast losses for a padded batch.
+
+    B is trajectory count, T is padded frame count, L is latent width, and F is
+    scene-feature width. Each forecast starts after WARMUP_LENGTH observations
+    and advances up to PREDICTION_HORIZON frames without observation updates.
+
+    @param observed_positions: XYZ observations (B, T, 3), with finite padding.
+    @param scene_features: Static scene features (B, F).
+    @param padding_frame_mask: Boolean tensor (B, T); True marks trailing padding.
+
+    @return: Scalar tensors position_loss, reconstruction_loss, consistency_loss,
+        and latent_std; integer position_element_count, reconstruction_element_count,
+        consistency_element_count, and observed_frame_count for epoch aggregation.
+        Forecast losses are zero when no frames remain after warm-up.
+    """
+    batch_size, padded_frame_count, position_size = observed_positions.shape
+
+    # Observation branch first since the autonomous rollouts depend on it
+    # prediction_horizon doesn't play a role here - observation updates computed once per frame
+
+    observation_states = _compute_observation_states(
+        model, observed_positions, scene_features, padding_frame_mask
+    )
+    observed_frame_count = int((~padding_frame_mask).sum().item())
+
+    # Decode each observation-updated state to train the encoder and updater.
+    # Flatten trajectory/time axes for the decoder, then restore the frame layout.
+    reconstructed_positions = model.decode_state(
+        observation_states.reshape(batch_size * padded_frame_count, model.latent_size)
+    ).reshape(batch_size, padded_frame_count, position_size)
+
+    reconstruction_error_sum = torch.sum(
+        (reconstructed_positions - observed_positions) ** 2
+        * (~padding_frame_mask).unsqueeze(-1)
+    )
+    reconstruction_element_count = observed_frame_count * position_size
+
+
+    # Autonomous rollout branch
+
+    # init to a scalar tensor that takes a gradient (useful if n=0)
+    position_error_sum = observed_positions.new_zeros(())
+    consistency_error_sum = observed_positions.new_zeros(())
+
+    forecast_frame_count = 0
+
+    # A forecast starts at the last observed frame of its warm-up. Its state
+    # remains connected to that history, but receives no subsequent observations.
+    for forecast_start_frame in range(WARMUP_LENGTH - 1, padded_frame_count - 1):
+        predicted_state = observation_states[:, forecast_start_frame]
+        forecast_stop_frame = min(
+            padded_frame_count,
+            forecast_start_frame + PREDICTION_HORIZON + 1,
+        )
+        for target_frame in range(forecast_start_frame + 1, forecast_stop_frame):
+            predicted_state = model.predict_state(predicted_state)
+            predicted_position = model.decode_state(predicted_state)
+            forecast_padding_mask = (
+                padding_frame_mask[:, forecast_start_frame]
+                | padding_frame_mask[:, target_frame]
+            )
+            position_error_sum = position_error_sum + torch.sum(
+                (predicted_position - observed_positions[:, target_frame]) ** 2
+                * (~forecast_padding_mask).unsqueeze(-1)
+            )
+            # avoid += because that would modify value in place -- for autograd that
+            # can be an issue if the earlier value is needed later (not here)
+            consistency_error_sum = (
+                consistency_error_sum
+                + _compute_consistency_error_sum(
+                    predicted_state,
+                    observation_states[:, target_frame],
+                    forecast_padding_mask,
+                )
+            )
+            forecast_frame_count += int((~forecast_padding_mask).sum().item())
+
+    # Average over scored scalar values, not padded frames or trajectory count.
+    # A frame can be scored by several forecasts starting at different times.
+    position_element_count = forecast_frame_count * position_size
+    consistency_element_count = forecast_frame_count * model.latent_size
+    observed_states = observation_states[~padding_frame_mask]
+    return {
+        "position_loss": position_error_sum / max(position_element_count, 1),
+        "reconstruction_loss": reconstruction_error_sum / max(reconstruction_element_count, 1),
+        "consistency_loss": consistency_error_sum / max(consistency_element_count, 1),
+        "latent_std": observed_states.std(dim=0, unbiased=False).mean(),
+        "position_element_count": position_element_count,
+        "reconstruction_element_count": reconstruction_element_count,
+        "consistency_element_count": consistency_element_count,
+        "observed_frame_count": observed_frame_count,
+    }
 
 
 def _process_epoch_pass(
-    model,
-    data_loader,
-    device,
-    optimizer,
-    input_velocity_innovation_std=0.0,
-):
-    total_loss = 0.0
-    sample_count = 0
+    model: LatentStateModel,
+    data_loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None,
+    reconstruction_weight: float,
+    consistency_weight: float,
+) -> dict[str, float]:
+    """Run one training or validation pass over trajectory batches.
 
-    for batch in data_loader:
-        histories, targets, scene_features = batch
-        histories = histories.to(device)
-        targets = targets.to(device)
+    Supplying an optimizer enables gradient updates; None computes validation
+    metrics only. Losses are weighted by their scored scalar counts; latent_std
+    is a frame-weighted mean of batch statistics, not a global standard deviation.
+
+    @param model: LatentStateModel being trained or evaluated.
+    @param data_loader: Loader yielding padded trajectory batches and masks.
+    @param device: Torch device receiving each batch.
+    @param optimizer: Optimizer for training, or None for validation.
+    @param reconstruction_weight: Multiplier for observation reconstruction MSE.
+    @param consistency_weight: Multiplier for detached-target latent MSE.
+
+    @return: Dictionary of mean losses, latent standard deviation, and total loss.
+    """
+    metric_sums = {
+        "position_loss": 0.0,
+        "reconstruction_loss": 0.0,
+        "consistency_loss": 0.0,
+        "latent_std": 0.0,
+    }
+    metric_counts = {
+        "position_loss": 0,
+        "reconstruction_loss": 0,
+        "consistency_loss": 0,
+        "latent_std": 0,
+    }
+    print('process_epoch_pass')
+    for observed_positions, scene_features, _, padding_frame_mask in data_loader:
+        observed_positions = observed_positions.to(device)
         scene_features = scene_features.to(device)
+        padding_frame_mask = padding_frame_mask.to(device)
         if optimizer is not None:
             optimizer.zero_grad()
-            histories = _add_random_walk_velocity_noise(
-                histories,
-                input_velocity_innovation_std,
-            )
 
-        # Predict multiple steps into the future progressively adding predictions into
-        # history for more informative loss calc
-        predictions = []
-        rollout_history = histories
-        for _ in range(targets.shape[1]):
-            predicted_position = model(rollout_history, scene_features)
-            predictions.append(predicted_position)
-            rollout_history = torch.cat(
-                [rollout_history[:, 1:], predicted_position.unsqueeze(1)],
-                dim=1,
-            )
-        predictions = torch.stack(predictions, dim=1)
-        loss = torch.mean((predictions - targets) ** 2)
-        if not torch.isfinite(loss):
-            error = ('Validation' if optimizer is None else 'Training') + "loss became non-finite."
-            raise RuntimeError(error)
-        
+        losses = _compute_batch_losses(
+            model,
+            observed_positions,
+            scene_features,
+            padding_frame_mask, # which frame for each trajectory are real and which are just padding at end
+        )
+        total_loss = (
+            losses["position_loss"]
+            + reconstruction_weight * losses["reconstruction_loss"]
+            + consistency_weight * losses["consistency_loss"]
+        )
+        if not torch.isfinite(total_loss):
+            pass_name = "Validation" if optimizer is None else "Training"
+            raise RuntimeError(f"{pass_name} loss became non-finite.")
         if optimizer is not None:
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
 
-        count = len(histories)
-        total_loss += loss.item() * count
-        sample_count += count
+        counts = {
+            "position_loss": losses["position_element_count"],
+            "reconstruction_loss": losses["reconstruction_element_count"],
+            "consistency_loss": losses["consistency_element_count"],
+            "latent_std": losses["observed_frame_count"],
+        }
+        for name in metric_sums:
+            metric_sums[name] += losses[name].item() * counts[name]
+            metric_counts[name] += counts[name]
 
-    return total_loss / sample_count
+    metrics = {
+        name: metric_sums[name] / max(metric_counts[name], 1)
+        for name in metric_sums
+    }
+    metrics["total_loss"] = (
+        metrics["position_loss"]
+        + reconstruction_weight * metrics["reconstruction_loss"]
+        + consistency_weight * metrics["consistency_loss"]
+    )
+    return metrics
+
+
+def _roll_out_model(
+    model,
+    observed_positions,
+    scene_features,
+    prediction_count,
+    device,
+):
+    """Build a latent from observed frames, then predict without observations (autonomous rollout)
+    This imitates the eval script can be used for evaluation of long-term rollout accuracy.
+    NOT USED IN TRAINING.    
+
+    The first observation updates a zero latent at its current frame. Each later
+    warm-up observation first advances the latent once and then updates it. After
+    the final observation, the function repeatedly predicts and decodes future
+    states; predicted positions are never fed back as observations.
+
+    @param model: LatentStateModel used for observation updates and prediction.
+    @param observed_positions: Warm-up positions shaped (B, T, 3) or (T, 3).
+    @param scene_features: Static scene features shaped (B, F) or (F,).
+    @param prediction_count: Number of future frames to predict autonomously.
+    @param device: Torch device used for the rollout.
+
+    @return: Predicted absolute positions with shape (B, prediction_count, 3).
+    """
+
+    # Format args and init
+
+    observed_positions = torch.as_tensor(
+        observed_positions,
+        dtype=torch.float32,
+        device=device,
+    )
+    if observed_positions.ndim == 2:
+        observed_positions = observed_positions.unsqueeze(0)
+
+    scene_features = torch.as_tensor(
+        scene_features,
+        dtype=torch.float32,
+        device=device,
+    )
+    if scene_features.ndim == 1:
+        scene_features = scene_features.unsqueeze(0)
+    if observed_positions.ndim != 3 or observed_positions.shape[2] != 3:
+        raise ValueError("observed_positions must have shape (batch, frames, 3)")
+    if observed_positions.shape[1] == 0:
+        raise ValueError("At least one warm-up observation is required.")
+
+    state = model.initialize_state(
+        observed_positions.shape[0],
+        device=device,
+        dtype=observed_positions.dtype,
+    )
+
+    # process warm up period to build up latent state
+    
+    for frame_index in range(observed_positions.shape[1]):
+        state = model.encode_predict_update_helper(
+            state,
+            observed_positions[:, frame_index],
+            scene_features,
+            advance=frame_index > 0,
+        )
+
+    # actually do autonomous rollout
+    
+    predicted_positions = []
+    for _ in range(prediction_count):
+        predicted_position, state = model(state)
+        predicted_positions.append(predicted_position)
+
+    if len(predicted_positions) == 0:
+        return observed_positions.new_empty((observed_positions.shape[0], 0, 3))
+
+    return torch.stack(predicted_positions, dim=1)
 
 
 @torch.inference_mode()
-def _evaluate_full_trajectory_rollouts(model, validation_dataset, device):
+def _compute_full_trajectory_rollouts(model, validation_dataset, device):
+    """Predict every validation trajectory after its observation warm-up.
+
+    Run after training finishes, this imitates the eval script and can be
+    used for evaluation of long-term rollout accuracy and detail error analysis.
+    NOT USED IN TRAINING.
+
+    @param model: LatentStateModel used for autonomous prediction.
+    @param validation_dataset: Dataset containing whole trajectories and scene features.
+    @param device: Torch device used for prediction and error calculation.
+
+    @return: One dictionary per trajectory containing actual and predicted XYZ
+        positions plus position, velocity, and velocity-innovation errors.
+    """
     trajectory_rollouts = []
 
-    for trajectory_dataset in validation_dataset.datasets:
-        actual_positions = torch.from_numpy(trajectory_dataset.positions).to(device)
-        history_length = trajectory_dataset.X.shape[1]
-        rollout_history = actual_positions[:history_length].unsqueeze(0)
-        scene_features = torch.from_numpy(
-            trajectory_dataset.scene_features
-        ).unsqueeze(0).to(device)
+    history_length = model.get_required_history()
+    for trajectory_positions, trajectory_features in zip(
+        validation_dataset.trajectories,
+        validation_dataset.scene_feature_tensor,
+    ):
+        actual_positions = torch.from_numpy(trajectory_positions).to(device)
+        scene_features = trajectory_features.unsqueeze(0).to(device)
 
-        predicted_positions = []
-        for _ in range(history_length, len(actual_positions)):
-            predicted_position = model(rollout_history, scene_features)
-            predicted_positions.append(predicted_position[0])
-            rollout_history = torch.cat(
-                [rollout_history[:, 1:], predicted_position.unsqueeze(1)],
-                dim=1,
-            )
+        predicted_positions = _roll_out_model(
+            model,
+            actual_positions[:history_length],
+            scene_features,
+            len(actual_positions) - history_length,
+            device,
+        )[0]
 
-        predicted_positions = torch.stack(predicted_positions)
         actual_future_positions = actual_positions[history_length:]
         position_errors = predicted_positions - actual_future_positions
 
@@ -151,65 +400,79 @@ def _evaluate_full_trajectory_rollouts(model, validation_dataset, device):
 
     return trajectory_rollouts
 
-def train_model(model,
-                train_data_loader,
-                validation_data_loader,
-                config,
-                device):
+def train_model(
+    model,
+    train_data_loader,
+    validation_data_loader,
+    config,
+    device,
+):
+    """Train the latent model and evaluate full autonomous validation rollouts.
 
-    optimizer = torch.optim.Adam(model.parameters(), config['lr'])
+    @param model: LatentStateModel to optimize.
+    @param train_data_loader: Loader of padded training trajectories.
+    @param validation_data_loader: Loader of padded validation trajectories.
+    @param config: Learning rate, epoch count, and loss weights.
+    @param device: Torch device used for training and validation.
 
-    training_errors = []
-    validation_errors = []
+    @return: Per-epoch training metrics, per-epoch validation metrics, and final
+        full-trajectory validation rollout dictionaries.
+    """
+    optimizer = torch.optim.Adam(model.parameters(), config["lr"])
+    training_metrics = []
+    validation_metrics = []
     validation_trajectory_rollouts = []
 
-    for epoch in range(config['epochs']):
+    for epoch in range(config["epochs"]):
         model.train()
-
-        mean_error =_process_epoch_pass(model, 
-                                        train_data_loader, 
-                                        device, 
-                                        optimizer,
-                                        config.get('input_velocity_innovation_std')
-                                        )
-
-        training_errors.append(mean_error)
+        training_metrics.append(
+            _process_epoch_pass(
+                model,
+                train_data_loader,
+                device,
+                optimizer,
+                config["reconstruction_weight"],
+                config["consistency_weight"],
+            )
+        )
 
         model.eval()
         with torch.inference_mode():
-            mean_error =_process_epoch_pass(model, 
-                                            validation_data_loader, 
-                                            device, 
-                                            None)
-
-            validation_errors.append(mean_error)
-            # For periodic evaluation, save validation trajectories from last epoch
-            if (
-                epoch == config['epochs'] - 1
-                and hasattr(validation_data_loader.dataset, "datasets")
-            ):
-                validation_trajectory_rollouts = _evaluate_full_trajectory_rollouts(
+            validation_metrics.append(
+                _process_epoch_pass(
+                    model,
+                    validation_data_loader,
+                    device,
+                    None,
+                    config["reconstruction_weight"],
+                    config["consistency_weight"],
+                )
+            )
+            if epoch == config["epochs"] - 1:
+                validation_trajectory_rollouts = _compute_full_trajectory_rollouts(
                     model,
                     validation_data_loader.dataset,
                     device,
                 )
 
         if epoch % 2 == 0:
-            print   ('epoch', epoch)
+            print("epoch", epoch)
 
-    return training_errors, validation_errors, validation_trajectory_rollouts
+    return training_metrics, validation_metrics, validation_trajectory_rollouts
 
 def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a phase 1.0 position predictor.")
+    parser = argparse.ArgumentParser(description="Train a latent-state world model.")
     parser.add_argument("--world-builder", default="simple-rolling")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--trajectories", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--trajectory-batch-size", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    # disabled for now since errors are note primarily due to that
-    parser.add_argument("--input-velocity-innovation-std", type=float, default=0)  # DISABLE BY DEFAULT FOR NOW - used 3e-3 as a reasonable ON value
     parser.add_argument("--hidden-size", type=int, default=64)
+    parser.add_argument("--latent-size", type=int, default=32)
+    parser.add_argument("--observation-embedding-size", type=int, default=32)
+    parser.add_argument("--reconstruction-weight", type=float, default=1.0)
+    parser.add_argument("--consistency-weight", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--backend", choices=("cpu", "gpu"), default="gpu")
     parser.add_argument(
@@ -219,67 +482,7 @@ def get_args() -> argparse.Namespace:
    # parser.add_argument("--output-dir", default="artifacts/phase1_0/run_001")
     return parser.parse_args()
 
-def main() -> None:
-    args = get_args()
-
-    import genesis as gs
-
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA was requested, but no CUDA device is available.")
-
-    if args.seed != 0:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        gs.init(backend=gs.gpu, seed=args.seed)
-    else:
-        gs.init(backend=gs.gpu)
-
-    world_builder = load_world_builder(args.world_builder)
-
-    trajectories, training_dataset, validation_dataset = create_trajectory_dataset(
-        world_builder,
-        args.seed,
-        args.steps,
-        args.trajectories,
-        HISTORY_WINDOW,
-        PREDICTION_HORIZON,
-    )
-
-    # Genesis sets PyTorch's default device to its backend during initialization.
-    # Keep DataLoader indices and shuffle permutations on CPU.
-    torch.set_default_device("cpu")
-    training_loader = DataLoader(
-        training_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-    )
-    validation_loader = DataLoader(
-        validation_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-    )
-
-    model = PositionHistoryMLP(HISTORY_WINDOW, args.hidden_size).to(device)
-
-    config = {'lr': args.learning_rate,
-              'epochs': args.epochs,
-              'input_velocity_innovation_std': args.input_velocity_innovation_std,
-              }
-
-    # Later move into a dedicated class
-    training_errors, validation_errors, validation_trajectory_rollouts = train_model(
-        model,
-        training_loader,
-        validation_loader,
-        config,
-        device,
-    )
-
-    output_dir = Path('artifacts/runs')
-
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _store_validation_rollouts(validation_trajectory_rollouts, output_dir):
     validation_rollout_lengths = np.asarray(
         [
             len(trajectory_rollout["position_errors"])
@@ -310,6 +513,94 @@ def main() -> None:
         **saved_validation_rollouts,
     )
 
+def main() -> None:
+    args = get_args()
+
+    import genesis as gs
+
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested, but no CUDA device is available.")
+
+    if args.seed != 0:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        gs.init(backend=gs.gpu, seed=args.seed)
+    else:
+        gs.init(backend=gs.gpu)
+
+    world_builder = load_world_builder(args.world_builder)
+
+    trajectories, training_dataset, validation_dataset = (
+        create_trajectory_sequence_dataset(
+            world_builder,
+            args.seed,
+            args.steps,
+            args.trajectories,
+        )
+    )
+
+    # Genesis sets PyTorch's default device to its backend during initialization.
+    # Keep DataLoader indices and shuffle permutations on CPU.
+    torch.set_default_device("cpu")
+    training_loader = DataLoader(
+        training_dataset,
+        batch_size=args.trajectory_batch_size,
+        shuffle=True,
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=args.trajectory_batch_size,
+        shuffle=False,
+    )
+    model = LatentStateModel(
+        latent_size=args.latent_size,
+        observation_embedding_size=args.observation_embedding_size,
+        hidden_size=args.hidden_size,
+        warm_up_length=WARMUP_LENGTH,
+    ).to(device)
+    config = {
+        "lr": args.learning_rate,
+        "epochs": args.epochs,
+        "reconstruction_weight": args.reconstruction_weight,
+        "consistency_weight": args.consistency_weight,
+    }
+    training_metrics, validation_metrics, validation_trajectory_rollouts = (
+        train_model(
+            model,
+            training_loader,
+            validation_loader,
+            config,
+            device,
+        )
+    )
+    checkpoint = {
+        "model_type": "LatentStateModel",
+        "latent_size": model.latent_size,
+        "observation_embedding_size": model.observation_embedding_size,
+        "hidden_size": model.hidden_size,
+        "scene_feature_size": model.scene_feature_size,
+        "warm_up_length": model.warm_up_length,
+        "prediction_horizon": PREDICTION_HORIZON,
+        "state_dict": model.state_dict(),
+        "training_metadata": {
+            "prediction_horizon": PREDICTION_HORIZON,
+            "reconstruction_weight": args.reconstruction_weight,
+            "consistency_weight": args.consistency_weight,
+            "trajectory_batch_size": args.trajectory_batch_size,
+        },
+    }
+    saved_metrics = {
+        "training": training_metrics,
+        "validation": validation_metrics,
+    }
+
+    output_dir = Path('artifacts/runs')
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _store_validation_rollouts(validation_trajectory_rollouts, output_dir)
+
     trajectory_lengths = np.asarray([len(trajectory) for trajectory in trajectories])
     saved_positions = np.full(
         (len(trajectories), trajectory_lengths.max(), 3),
@@ -318,40 +609,24 @@ def main() -> None:
     )
     for trajectory_index, trajectory in enumerate(trajectories):
         saved_positions[trajectory_index, :len(trajectory)] = trajectory
+
+    saved_scene_features = torch.cat(
+        [
+            training_dataset.scene_feature_tensor,
+            validation_dataset.scene_feature_tensor,
+        ]
+    ).cpu().numpy()
     np.savez(
         output_dir / "trajectory.npz",
         positions=saved_positions,
         trajectory_lengths=trajectory_lengths,
-        scene_features=np.stack(
-            [
-                trajectory_dataset.scene_features
-                for trajectory_dataset in (
-                    training_dataset.datasets + validation_dataset.datasets
-                )
-            ]
-        ),
+        scene_features=saved_scene_features,
     )
-    torch.save(
-        {
-            "model_type": "PositionHistoryMLP",
-            "history_length": HISTORY_WINDOW,
-            "prediction_horizon": PREDICTION_HORIZON,
-            "hidden_size": args.hidden_size,
-            "scene_feature_size": model.scene_feature_size,
-            "state_dict": model.state_dict(),
-        },
-        output_dir / "checkpoint.tar",
-    )
+    torch.save(checkpoint, output_dir / "checkpoint.tar")
     (output_dir / "metrics.json").write_text(
-        json.dumps(
-            {
-                "training_error": training_errors,
-                "validation_error": validation_errors,
-            },
-            indent=2,
-        )
+        json.dumps(saved_metrics, indent=2)
     )
-    print(f"Saved phase 1.0 artifacts to {output_dir}")
+    print(f"Saved training artifacts to {output_dir}")
 
 
 if __name__ == "__main__":

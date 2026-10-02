@@ -1,0 +1,322 @@
+import unittest
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from eval import _load_checkpoint_model
+from sim.utilities.sim_utils import PredictionWorld
+from train import (
+    _compute_batch_losses,
+    _compute_observation_states,
+    _roll_out_model,
+    _compute_consistency_error_sum,
+)
+from training import TrajectorySequenceDataset
+from world_models import LatentStateModel, PositionHistoryMLP
+
+
+class FrameCountingLatentModel(LatentStateModel):
+    def __init__(self):
+        super().__init__(
+            latent_size=1,
+            observation_embedding_size=1,
+            hidden_size=2,
+            scene_feature_size=1,
+            warm_up_length=2,
+        )
+
+    def get_required_history(self):
+        return 2
+
+    def initialize_state(self, batch_size, *, device, dtype):
+        return torch.zeros((batch_size, 1), device=device, dtype=dtype)
+
+    def encode_predict_update_helper(
+        self,
+        state,
+        position,
+        scene_features,
+        *,
+        advance,
+    ):
+        del scene_features
+        return state + (10.0 if advance else 0.0) + position[:, :1]
+
+    def forward(self, state):
+        next_state = state + 10.0
+        return next_state.expand(-1, 3), next_state
+
+
+class LatentStateTest(unittest.TestCase):
+    def test_standard_loader_uses_dataset_wide_padding(self):
+        """Even a batch of one retains dataset padding and the original length."""
+        short_trajectory = np.ones((2, 3), dtype=np.float32)
+        dataset = TrajectorySequenceDataset(
+            [short_trajectory, np.full((5, 3), 2.0, dtype=np.float32)],
+            np.zeros((2, 2), dtype=np.float32),
+        )
+        positions, _, lengths, padding_frame_mask = next(iter(DataLoader(dataset)))
+        self.assertEqual(positions.shape, (1, 5, 3))
+        torch.testing.assert_close(lengths, torch.tensor([2]))
+        torch.testing.assert_close(
+            padding_frame_mask, torch.tensor([[False, False, True, True, True]])
+        )
+        torch.testing.assert_close(positions[0, :2], torch.ones((2, 3)))
+        torch.testing.assert_close(positions[0, 2:], torch.zeros((3, 3)))
+        np.testing.assert_array_equal(dataset.trajectories[0], short_trajectory)
+
+    def test_checkpoint_dispatch_keeps_model_types_distinct(self):
+        latent_model = LatentStateModel(
+            latent_size=4,
+            observation_embedding_size=3,
+            hidden_size=8,
+            scene_feature_size=2,
+            warm_up_length=3,
+        )
+        loaded_latent_model = _load_checkpoint_model(
+            {
+                "model_type": "LatentStateModel",
+                "latent_size": 4,
+                "observation_embedding_size": 3,
+                "hidden_size": 8,
+                "scene_feature_size": 2,
+                "warm_up_length": 3,
+                "state_dict": latent_model.state_dict(),
+            },
+            torch.device("cpu"),
+        )
+        baseline_model = PositionHistoryMLP(
+            history_length=3,
+            hidden_size=8,
+            scene_feature_size=2,
+        )
+        loaded_baseline_model = _load_checkpoint_model(
+            {
+                "model_type": "PositionHistoryMLP",
+                "history_length": 3,
+                "hidden_size": 8,
+                "scene_feature_size": 2,
+                "state_dict": baseline_model.state_dict(),
+            },
+            torch.device("cpu"),
+        )
+
+        self.assertIsInstance(loaded_latent_model, LatentStateModel)
+        self.assertIsInstance(loaded_baseline_model, PositionHistoryMLP)
+
+    def test_legacy_checkpoint_uses_latent_width_for_observation_embedding(self):
+        """Load checkpoints created before observation width was configurable."""
+        model = LatentStateModel(latent_size=4, observation_embedding_size=4)
+        loaded_model = _load_checkpoint_model(
+            {
+                "model_type": "LatentStateModel",
+                "latent_size": 4,
+                "hidden_size": model.hidden_size,
+                "warm_up_length": model.warm_up_length,
+                "state_dict": model.state_dict(),
+            },
+            torch.device("cpu"),
+        )
+        position = torch.randn((2, 3))
+        scene_features = torch.randn((2, model.scene_feature_size))
+        torch.testing.assert_close(
+            loaded_model.encode_observation(position, scene_features),
+            model.encode_observation(position, scene_features),
+        )
+
+    def test_observation_corrects_a_predicted_frame_without_advancing_again(self):
+        predicted_world = PredictionWorld(
+            np.ones((1, 1, 3), dtype=np.float32),
+            FrameCountingLatentModel(),
+            np.zeros((1, 1), dtype=np.float32),
+        )
+
+        predicted_world.observe(np.full((1, 1, 3), 2.0, dtype=np.float32))
+        self.assertEqual(predicted_world.latent_state.item(), 13.0)
+        predicted_world.step()
+        self.assertEqual(predicted_world.latent_state.item(), 23.0)
+
+        predicted_world.observe(np.full((1, 1, 3), 3.0, dtype=np.float32))
+
+        self.assertEqual(predicted_world.latent_state.item(), 26.0)
+
+    def test_prediction_branches_do_not_mutate_the_starting_state(self):
+        model = LatentStateModel(
+            latent_size=4,
+            observation_embedding_size=3,
+            hidden_size=8,
+            scene_feature_size=2,
+        )
+        starting_state = torch.randn((2, 4))
+        saved_starting_state = starting_state.clone()
+
+        first_branch = model.predict_state(starting_state)
+        second_branch = model.predict_state(starting_state)
+        model.predict_state(first_branch)
+
+        torch.testing.assert_close(starting_state, saved_starting_state)
+        torch.testing.assert_close(first_branch, second_branch)
+
+    def test_padding_is_excluded_from_updates_and_losses(self):
+        dataset = TrajectorySequenceDataset(
+            [
+                np.arange(18, dtype=np.float32).reshape(6, 3),
+                np.arange(24, dtype=np.float32).reshape(8, 3),
+            ],
+            np.zeros((2, 2), dtype=np.float32),
+        )
+        positions, features, lengths, padding_frame_mask = next(
+            iter(
+                DataLoader(
+                    dataset,
+                    batch_size=2,
+                )
+            )
+        )
+        model = LatentStateModel(
+            latent_size=4,
+            observation_embedding_size=3,
+            hidden_size=8,
+            scene_feature_size=2,
+            warm_up_length=3,
+        )
+
+        losses = _compute_batch_losses(
+            model,
+            positions,
+            features,
+            padding_frame_mask,
+        )
+        changed_padding = positions.clone()
+        changed_padding[padding_frame_mask] = 1e6
+        changed_losses = _compute_batch_losses(
+            model,
+            changed_padding,
+            features,
+            padding_frame_mask,
+        )
+
+        torch.testing.assert_close(lengths, torch.tensor([6, 8]))
+        torch.testing.assert_close(
+            padding_frame_mask,
+            torch.tensor([
+                [False, False, False, False, False, False, True, True],
+                [False, False, False, False, False, False, False, False],
+            ]),
+        )
+        for name in ("position_loss", "reconstruction_loss", "consistency_loss"):
+            torch.testing.assert_close(losses[name], changed_losses[name])
+
+        observation_states = _compute_observation_states(
+            model, changed_padding, features, padding_frame_mask
+        )
+        torch.testing.assert_close(observation_states[0, 6], observation_states[0, 5])
+        torch.testing.assert_close(observation_states[0, 7], observation_states[0, 5])
+        loss_names = ("position_loss", "reconstruction_loss", "consistency_loss")
+        original_gradients = torch.autograd.grad(
+            sum(losses[name] for name in loss_names), model.parameters()
+        )
+        changed_gradients = torch.autograd.grad(
+            sum(changed_losses[name] for name in loss_names), model.parameters()
+        )
+        for original_gradient, changed_gradient in zip(original_gradients, changed_gradients):
+            torch.testing.assert_close(original_gradient, changed_gradient)
+
+    def test_short_trajectory_has_reconstruction_but_no_forecast_loss(self):
+        """A single observation cannot seed a forecast after the warm-up."""
+        model = LatentStateModel(latent_size=4, observation_embedding_size=3)
+        losses = _compute_batch_losses(
+            model,
+            torch.ones((1, 1, 3)),
+            torch.zeros((1, model.scene_feature_size)),
+            torch.zeros((1, 1), dtype=torch.bool),
+        )
+        self.assertEqual(losses["observed_frame_count"], 1)
+        self.assertEqual(losses["reconstruction_element_count"], 3)
+        self.assertTrue(torch.isfinite(losses["reconstruction_loss"]))
+        self.assertEqual(losses["position_element_count"], 0)
+        self.assertEqual(losses["consistency_element_count"], 0)
+        self.assertEqual(losses["position_loss"].item(), 0.0)
+        self.assertEqual(losses["consistency_loss"].item(), 0.0)
+
+    def test_consistency_loss_detaches_only_the_target(self):
+        predictions = torch.ones((2, 3), requires_grad=True)
+        targets = torch.zeros((2, 3), requires_grad=True)
+
+        loss = _compute_consistency_error_sum(
+            predictions,
+            targets,
+            torch.tensor([False, True]),
+        )
+        loss.backward()
+
+        self.assertEqual(loss.item(), 3.0)
+        torch.testing.assert_close(
+            predictions.grad, torch.tensor([[2.0, 2.0, 2.0], [0.0, 0.0, 0.0]])
+        )
+        self.assertIsNone(targets.grad)
+
+    def test_reconstruction_loss_trains_encoder_and_updater(self):
+        model = LatentStateModel(
+            latent_size=4,
+            observation_embedding_size=3,
+            hidden_size=8,
+            scene_feature_size=2,
+            warm_up_length=2,
+        )
+        positions = torch.randn((2, 4, 3))
+        features = torch.randn((2, 2))
+        padding_frame_mask = torch.zeros((2, 4), dtype=torch.bool)
+
+        losses = _compute_batch_losses(
+            model,
+            positions,
+            features,
+            padding_frame_mask,
+        )
+        losses["reconstruction_loss"].backward()
+
+        self.assertTrue(
+            any(parameter.grad is not None for parameter in model.observation_encoder.parameters())
+        )
+        self.assertTrue(
+            any(parameter.grad is not None for parameter in model.state_updater.parameters())
+        )
+
+    def test_training_and_prediction_world_rollouts_match(self):
+        torch.manual_seed(4)
+        model = LatentStateModel(
+            latent_size=4,
+            observation_embedding_size=3,
+            hidden_size=8,
+            scene_feature_size=2,
+            warm_up_length=3,
+        )
+        observed_positions = np.arange(9, dtype=np.float32).reshape(3, 3) / 10.0
+        scene_features = np.asarray([[0.2, -0.1]], dtype=np.float32)
+        expected = _roll_out_model(
+            model,
+            observed_positions,
+            scene_features,
+            prediction_count=3,
+            device=torch.device("cpu"),
+        )[0].detach().numpy()
+
+        predicted_world = PredictionWorld(
+            observed_positions[:1, None, :].transpose(1, 0, 2),
+            model,
+            scene_features,
+        )
+        predicted_world.observe(observed_positions[1][None, None, :])
+        predicted_world.observe(observed_positions[2][None, None, :])
+        actual = []
+        for _ in range(3):
+            predicted_world.step()
+            actual.append(predicted_world.mobile_positions[0, 0].copy())
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+if __name__ == "__main__":
+    unittest.main()

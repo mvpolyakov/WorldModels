@@ -1,10 +1,13 @@
 from pathlib import Path
 import numpy as np
 from PIL import Image
+import torch
 
 import genesis as gs
 
+from world_models import LatentStateModel
 
+# Used in evaluation only
 class PredictionWorld:
     """Prediction-only world containing mobile state and a world model.
         For models that require history, keeps track of that as well 
@@ -14,6 +17,8 @@ class PredictionWorld:
         contains the full history of mobile_positions, with the last value along the 
         time dimension==mobile_positions. Observations seed the history during warm-up,
         then step() updates both with predictions.
+
+        For reccurent models, accumulate and carry state here
     """
 
     def __init__(self, initial_mobile_positions, model, scene_features):
@@ -23,18 +28,84 @@ class PredictionWorld:
         # history of the positions - with the time dimensions added as 3rd axis
         self.position_history = self.mobile_positions[:, :, None, :].copy()
         self.scene_features = scene_features
+        self._uses_recurrent_state = isinstance(model, LatentStateModel)
+        
+        if self._uses_recurrent_state:
+            # Generate the first latent state by doing the first encoding step (but no prediction)
 
-    def needs_warm_up(self):
+            self._observed_frame_count = 1
+
+            # Indicates the stored latent represents a prediction for the current frame that hasn’t yet incorporated that frame’s observation.
+            # After step(): True—the model has advanced to the next frame by prediction.
+            # After observe(): False—the state incorporates the observation.
+            self._state_needs_observation_update = False
+            batch_size, mobile_count = self.mobile_positions.shape[:2]
+            device = next(model.parameters()).device
+
+            features = torch.as_tensor(
+                scene_features,
+                dtype=torch.float32,
+                device=device,
+            )
+            
+            self._raw_scene_features = features[:, None, :].expand(
+                batch_size,
+                mobile_count,
+                -1,
+            ).reshape(batch_size * mobile_count, -1)
+            
+            positions = torch.as_tensor(
+                self.mobile_positions,
+                dtype=torch.float32,
+                device=device,
+            ).reshape(batch_size * mobile_count, 3)
+
+            with torch.inference_mode():
+                initial_state = model.initialize_state(
+                    batch_size * mobile_count,
+                    device=device,
+                    dtype=positions.dtype,
+                )
+                self.latent_state = model.encode_predict_update_helper(
+                    initial_state,
+                    positions,
+                    self._raw_scene_features,
+                    advance=False,
+                )
+
+    def needs_more_warm_up(self):
         """Return whether the model still needs observed history."""
-        return self.position_history.shape[2] < self.model.get_required_history()
+        if self._uses_recurrent_state:
+            return self._observed_frame_count < self.model.get_required_history()
+        else:
+            return self.position_history.shape[2] < self.model.get_required_history()
 
     def observe(self, observed_mobile_positions):
-        """Add observed positions to the prediction history during warmup."""
+        """Add observed positions to the prediction history during warmup.
+            For reccurent models, update prediction state with observed positions at the current frame.
+        """
         self.mobile_positions[...] = observed_mobile_positions
         self.position_history = np.concatenate(
             [self.position_history, observed_mobile_positions[:, :, None, :]],
             axis=2,
         )
+        if self._uses_recurrent_state:
+            batch_size, mobile_count = self.mobile_positions.shape[:2]
+            positions = torch.as_tensor(
+                observed_mobile_positions,
+                dtype=torch.float32,
+                device=self.latent_state.device,
+            ).reshape(batch_size * mobile_count, 3)
+            with torch.inference_mode():
+                self.latent_state = self.model.encode_predict_update_helper(
+                    self.latent_state,
+                    positions,
+                    self._raw_scene_features,
+                    # whether need to predict first before updating - for sequencing
+                    advance=not self._state_needs_observation_update, 
+                )
+            self._observed_frame_count += 1
+            self._state_needs_observation_update = False
 
     def step(self):
         """Advance each predicted mobile by one model step.
@@ -42,17 +113,31 @@ class PredictionWorld:
         ``mobile_positions`` is a (B, K, 3) array containing all environments
         and mobiles. Static scene features are passed separately when present.
         
-        position_history adds a T time dimension to it
+        position_history adds a T time dimension to it; latent state models update the latent state
 
         """
-        required_history_size = self.model.get_required_history()
+        if self._uses_recurrent_state:
+            batch_size, mobile_count = self.mobile_positions.shape[:2]
+            with torch.inference_mode():
+                predicted_positions, self.latent_state = self.model(
+                    self.latent_state
+                )
+            predicted_positions = predicted_positions.reshape(
+                batch_size,
+                mobile_count,
+                3,
+            ).cpu().numpy()
+            self._state_needs_observation_update = True
+        else:
 
-        desired_history = self.position_history[:, :, -required_history_size:, :]
+            required_history_size = self.model.get_required_history()
 
-        predicted_positions = self.model.predict(
-            desired_history,
-            self.scene_features,
-        )
+            desired_history = self.position_history[:, :, -required_history_size:, :]
+
+            predicted_positions = self.model.predict(
+                desired_history,
+                self.scene_features,
+            )
 
         self.position_history = np.concatenate(
             [self.position_history, predicted_positions[:, :, None, :]],
