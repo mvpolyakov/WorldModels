@@ -38,6 +38,9 @@ class PositionHistoryMLP(nn.Module):
         '''
         history: (batch, history, 3) tensor of XYZ positions.
         scene_features: (batch, 10) ramp center, two ramp axes, and ball radius.
+
+        The network parameterizes the transition as a displacement, which is added
+        to the final history position before returning the next position.
         '''
         if history.ndim != 3 or history.shape[1:] != (self.history_length, 3):
             raise ValueError(
@@ -59,7 +62,8 @@ class PositionHistoryMLP(nn.Module):
             [history.reshape(history.shape[0], -1), scene_features],
             dim=1,
         )
-        return self.network(inputs)
+        displacement = self.network(inputs)
+        return history[:, -1] + displacement
 
     # just a helpful method for inference - when dealing with simulator 
     # at each step - handles type conversion and input reshaping -- not for training
@@ -102,8 +106,13 @@ class PositionHistoryMLP(nn.Module):
         features = features[:, None, :].expand(batch_size, n_objects, -1)
         features = features.reshape(batch_size * n_objects, self.scene_feature_size)
 
+        object_histories = tensor.reshape(
+            batch_size * n_objects,
+            self.history_length,
+            3,
+        )
         positions = self(
-            tensor.reshape(batch_size * n_objects, self.history_length, 3),
+            object_histories,
             features,
         )
         return positions.reshape(batch_size, n_objects, 3).cpu().numpy()
