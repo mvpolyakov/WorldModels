@@ -336,6 +336,7 @@ def main() -> None:
     torch.save(
         {
             "model_type": "PositionHistoryMLP",
+            "world_builder": args.world_builder,
             "history_length": HISTORY_WINDOW,
             "prediction_horizon": PREDICTION_HORIZON,
             "hidden_size": args.hidden_size,

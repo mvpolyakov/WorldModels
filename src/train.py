@@ -462,7 +462,7 @@ def train_model(
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a latent-state world model.")
-    parser.add_argument("--world-builder", default="simple-rolling")
+    parser.add_argument("--world-builder", default="opposing-ramps")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--trajectories", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=50)
@@ -578,6 +578,7 @@ def main() -> None:
     )
     checkpoint = {
         "model_type": "LatentStateModel",
+        "world_builder": args.world_builder,
         "latent_size": model.latent_size,
         "observation_embedding_size": model.observation_embedding_size,
         "hidden_size": model.hidden_size,

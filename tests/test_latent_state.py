@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -8,6 +9,7 @@ from eval import (
     _load_checkpoint_model,
     _resolve_world_builder_name,
     _validate_scene_feature_size,
+    get_args as get_eval_args,
 )
 from sim.scene_features import (
     OPPOSING_RAMPS_SCENE_FEATURE_SIZE,
@@ -19,6 +21,7 @@ from train import (
     _compute_observation_states,
     _roll_out_model,
     _compute_consistency_error_sum,
+    get_args as get_training_args,
 )
 from training import TrajectorySequenceDataset
 from world_models import LatentStateModel, PositionHistoryMLP
@@ -57,6 +60,15 @@ class FrameCountingLatentModel(LatentStateModel):
 
 
 class LatentStateTest(unittest.TestCase):
+    def test_primary_world_command_line_defaults(self):
+        with patch("sys.argv", ["train.py"]):
+            self.assertEqual(
+                get_training_args().world_builder,
+                "opposing-ramps",
+            )
+        with patch("sys.argv", ["eval.py"]):
+            self.assertIsNone(get_eval_args().world)
+
     def test_eval_resolves_explicit_checkpoint_and_legacy_worlds(self):
         self.assertEqual(
             _resolve_world_builder_name(
