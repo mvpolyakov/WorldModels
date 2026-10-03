@@ -12,7 +12,7 @@ from training.trajectories import create_trajectory_sequence_dataset
 from world_models import LatentStateModel
 
 WARMUP_LENGTH = 3  # Min 2 frames for change detection since includes the frame from which we predict; three for acceleration.
-PREDICTION_HORIZON = 5
+PREDICTION_HORIZON = 3
 
 
 def _compute_observation_states(
@@ -558,6 +558,7 @@ def main() -> None:
         latent_size=args.latent_size,
         observation_embedding_size=args.observation_embedding_size,
         hidden_size=args.hidden_size,
+        scene_feature_size=world_builder.scene_feature_size,
         warm_up_length=WARMUP_LENGTH,
     ).to(device)
     config = {

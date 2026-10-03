@@ -4,7 +4,15 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from eval import _load_checkpoint_model
+from eval import (
+    _load_checkpoint_model,
+    _resolve_world_builder_name,
+    _validate_scene_feature_size,
+)
+from sim.scene_features import (
+    OPPOSING_RAMPS_SCENE_FEATURE_SIZE,
+    SIMPLE_ROLLING_SCENE_FEATURE_SIZE,
+)
 from sim.utilities.sim_utils import PredictionWorld
 from train import (
     _compute_batch_losses,
@@ -49,6 +57,53 @@ class FrameCountingLatentModel(LatentStateModel):
 
 
 class LatentStateTest(unittest.TestCase):
+    def test_eval_resolves_explicit_checkpoint_and_legacy_worlds(self):
+        self.assertEqual(
+            _resolve_world_builder_name(
+                "opposing-ramps", {"world_builder": "simple-rolling"}
+            ),
+            "opposing-ramps",
+        )
+        self.assertEqual(
+            _resolve_world_builder_name(
+                None, {"world_builder": "opposing-ramps"}
+            ),
+            "opposing-ramps",
+        )
+        self.assertEqual(
+            _resolve_world_builder_name(None, {}),
+            "simple-rolling",
+        )
+        self.assertEqual(
+            _resolve_world_builder_name(None, None),
+            "opposing-ramps",
+        )
+
+    def test_eval_rejects_incompatible_scene_feature_width(self):
+        model = LatentStateModel(
+            latent_size=4,
+            observation_embedding_size=3,
+            scene_feature_size=2,
+        )
+
+        _validate_scene_feature_size(
+            model,
+            np.zeros((1, 2), dtype=np.float32),
+            "compatible-world",
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "produces 19 scene features, but this model expects 2",
+        ):
+            _validate_scene_feature_size(
+                model,
+                np.zeros(
+                    (1, OPPOSING_RAMPS_SCENE_FEATURE_SIZE),
+                    dtype=np.float32,
+                ),
+                "opposing-ramps",
+            )
+
     def test_standard_loader_uses_dataset_wide_padding(self):
         """Even a batch of one retains dataset padding and the original length."""
         short_trajectory = np.ones((2, 3), dtype=np.float32)
@@ -107,7 +162,11 @@ class LatentStateTest(unittest.TestCase):
 
     def test_legacy_checkpoint_uses_latent_width_for_observation_embedding(self):
         """Load checkpoints created before observation width was configurable."""
-        model = LatentStateModel(latent_size=4, observation_embedding_size=4)
+        model = LatentStateModel(
+            latent_size=4,
+            observation_embedding_size=4,
+            scene_feature_size=SIMPLE_ROLLING_SCENE_FEATURE_SIZE,
+        )
         loaded_model = _load_checkpoint_model(
             {
                 "model_type": "LatentStateModel",

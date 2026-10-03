@@ -1,0 +1,74 @@
+{
+    "landscape": [
+        {
+            "name": "ramp_a",
+            "morph_type": "Box",
+            "morph_params": {
+                "pos": [-2.562392, 0.169500, 0.469342],
+                "euler": [0.0, -15.0, 175.0],
+                "size": [4.0, 5.0, 0.1],
+                "fixed": true
+            },
+            "friction": 0.5,
+            "friction_torsional": 0.005,
+            "friction_rolling": 0.005,
+            "rho": 1000.0,
+            "color": [0.6, 0.5, 0.4, 1.0]
+        },
+        {
+            "name": "ramp_b",
+            "morph_type": "Box",
+            "morph_params": {
+                "pos": [2.514270, 0.165290, 0.637056],
+                "euler": [0.0, -20.0, 5.0],
+                "size": [4.0, 5.0, 0.1],
+                "fixed": true
+            },
+            "friction": 0.5,
+            "friction_torsional": 0.005,
+            "friction_rolling": 0.005,
+            "rho": 1000.0,
+            "color": [0.65, 0.55, 0.45, 1.0]
+        },
+        {
+            "name": "ground",
+            "morph_type": "Box",
+            "morph_params": {
+                "pos": [0.0, 0.0, -0.025],
+                "size": [20.0, 20.0, 0.05],
+                "fixed": true
+            },
+            "friction": 1.0,
+            "friction_torsional": 0.005,
+            "friction_rolling": 0.03,
+            "rho": 1000.0,
+            "color": [0.3, 0.3, 0.3, 1.0]
+        }
+    ],
+    "mobiles": [
+        {
+            "name": "ball",
+            "morph_type": "Sphere",
+            "morph_params": {
+                "pos": [-1.725555, 0.096286, 0.513427],
+                "radius": 0.2,
+                "euler": [0.0, 0.0, 0.0]
+            },
+            "friction": 2.9,
+            "friction_torsional": 0.005,
+            "friction_rolling": 0.005,
+            "rho": 500.0,
+            "color": [0.2, 0.6, 1.0, 1.0]
+        }
+    ],
+    "camera": {
+        "viewer_pos": [3.0, -5.0, 2.5],
+        "viewer_lookat": [0.0, 0.0, 0.5],
+        "viewer_fov": 45.0,
+        "obs_pos": [0.0, -5.0, 2.0],
+        "obs_lookat": [0.0, 0.0, 0.5],
+        "obs_res": [320, 240],
+        "obs_fov": 45.0
+    },
+    "gravity": [0.0, 0.0, -9.81]
+}

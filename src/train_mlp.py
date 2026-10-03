@@ -259,7 +259,11 @@ def main() -> None:
         shuffle=False,
     )
 
-    model = PositionHistoryMLP(HISTORY_WINDOW, args.hidden_size).to(device)
+    model = PositionHistoryMLP(
+        HISTORY_WINDOW,
+        args.hidden_size,
+        scene_feature_size=world_builder.scene_feature_size,
+    ).to(device)
 
     config = {'lr': args.learning_rate,
               'epochs': args.epochs,

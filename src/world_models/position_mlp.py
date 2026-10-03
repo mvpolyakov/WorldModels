@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import nn
 
-SCENE_FEATURE_SIZE = 10
+from sim.scene_features import SIMPLE_ROLLING_SCENE_FEATURE_SIZE
 
 
 class PositionHistoryMLP(nn.Module):
@@ -14,7 +14,7 @@ class PositionHistoryMLP(nn.Module):
         self,
         history_length: int = 5,
         hidden_size: int = 64,
-        scene_feature_size: int = SCENE_FEATURE_SIZE,
+        scene_feature_size: int = SIMPLE_ROLLING_SCENE_FEATURE_SIZE,
     ):
         super().__init__()
         self.history_length = history_length

@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from .position_mlp import SCENE_FEATURE_SIZE
+from sim.scene_features import OPPOSING_RAMPS_SCENE_FEATURE_SIZE
 
 
 def _build_mlp(input_size: int, output_size: int, hidden_size: int) -> nn.Sequential:
@@ -40,7 +40,7 @@ class LatentStateModel(nn.Module):
         self,
         latent_size: int = 64,
         hidden_size: int = 64,
-        scene_feature_size: int = SCENE_FEATURE_SIZE,
+        scene_feature_size: int = OPPOSING_RAMPS_SCENE_FEATURE_SIZE,
         warm_up_length: int = 5,
         *,
         observation_embedding_size: int,

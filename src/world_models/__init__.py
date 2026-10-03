@@ -1,10 +1,9 @@
 from .dummy import DummyWorldModel
 from .latent_state import LatentStateModel
-from .position_mlp import PositionHistoryMLP, SCENE_FEATURE_SIZE
+from .position_mlp import PositionHistoryMLP
 
 __all__ = [
     "DummyWorldModel",
     "LatentStateModel",
     "PositionHistoryMLP",
-    "SCENE_FEATURE_SIZE",
 ]

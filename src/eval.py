@@ -7,6 +7,7 @@ import torch
 
 from sim.build_world import load_world_builder
 from sim.dataclasses import add_scene_controls
+from sim.scene_features import SIMPLE_ROLLING_SCENE_FEATURE_SIZE
 from sim.utilities.sim_utils import (
     DisplacementErrorTracker,
     PredictionWorld,
@@ -19,8 +20,32 @@ from world_models import (
     DummyWorldModel,
     LatentStateModel,
     PositionHistoryMLP,
-    SCENE_FEATURE_SIZE,
 )
+
+
+def _resolve_world_builder_name(
+    requested_world: str | None,
+    checkpoint: dict | None,
+) -> str:
+    """Select an explicit, checkpoint-recorded, or compatible default world."""
+    if requested_world is not None:
+        return requested_world
+    if checkpoint is not None:
+        return checkpoint.get("world_builder", "simple-rolling")
+    return "opposing-ramps"
+
+
+def _validate_scene_feature_size(model, world_scene_features, world_builder_name: str) -> None:
+    """Reject a world whose scene features cannot be consumed by the model."""
+    if not isinstance(model, (LatentStateModel, PositionHistoryMLP)):
+        return
+    actual_feature_size = world_scene_features.shape[1]
+    if actual_feature_size != model.scene_feature_size:
+        raise ValueError(
+            f"World builder '{world_builder_name}' produces "
+            f"{actual_feature_size} scene features, but this model expects "
+            f"{model.scene_feature_size}."
+        )
 
 
 def _load_checkpoint_model(checkpoint, device):
@@ -38,7 +63,7 @@ def _load_checkpoint_model(checkpoint, device):
             hidden_size=checkpoint["hidden_size"],
             scene_feature_size=checkpoint.get(
                 "scene_feature_size",
-                SCENE_FEATURE_SIZE,
+                SIMPLE_ROLLING_SCENE_FEATURE_SIZE,
             ),
         )
     elif checkpoint.get("model_type") == "LatentStateModel":
@@ -50,7 +75,7 @@ def _load_checkpoint_model(checkpoint, device):
             hidden_size=checkpoint["hidden_size"],
             scene_feature_size=checkpoint.get(
                 "scene_feature_size",
-                SCENE_FEATURE_SIZE,
+                SIMPLE_ROLLING_SCENE_FEATURE_SIZE,
             ),
             warm_up_length=checkpoint["warm_up_length"],
         )
@@ -66,7 +91,7 @@ def get_args():
     parser.add_argument("--output-image", type=str, default="artifacts/ball_path.png")
     parser.add_argument("--output-error-chart", type=str, default="artifacts/displacement_error.png")
 
-    parser.add_argument("--world", type=str, default="simple-rolling")
+    parser.add_argument("--world", type=str, default="opposing-ramps")
     parser.add_argument("--randomize-scene", action="store_true")
 
     parser.add_argument("--model", type=str, default="")
@@ -85,6 +110,7 @@ def main() -> None:
 
     # Load model
 
+    checkpoint = None
     if args.model == '':
         print('loading dummy random model')
         model = DummyWorldModel()
@@ -95,7 +121,8 @@ def main() -> None:
 
     # Create world
 
-    world_builder = load_world_builder(args.world)
+    world_builder_name = _resolve_world_builder_name(args.world, checkpoint)
+    world_builder = load_world_builder(world_builder_name)
 
     ghost_count = max(
         1 + args.steps // args.ghost_interval,
@@ -109,6 +136,11 @@ def main() -> None:
         n_environments=1,
         ghost_count=ghost_count,
         random_generator=random_generator,
+    )
+    _validate_scene_feature_size(
+        model,
+        world.scene_features,
+        world_builder_name,
     )
 
     draw_ground_coordinate_lines(world.scene, world_builder.config)
