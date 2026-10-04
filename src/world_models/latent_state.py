@@ -21,6 +21,29 @@ def _build_mlp(input_size: int, output_size: int, hidden_size: int) -> nn.Sequen
         nn.Linear(hidden_size, output_size),
     )
 
+def _build_mlp2(input_size: int, output_size: int) -> nn.Sequential:
+    """Build an MLP with two ReLU-activated hidden layers.
+
+    @param input_size: Number of input values per sample.
+    @param output_size: Number of output values per sample.
+    @param hidden_size: Width of both hidden layers.
+
+    @return: Sequential linear network mapping input_size to output_size.
+    """
+
+    hidden_size = 64
+    return nn.Sequential(
+        nn.Linear(input_size, hidden_size),
+        nn.ReLU(),
+        nn.Linear(hidden_size, hidden_size),
+        nn.ReLU(),
+        nn.Linear(hidden_size, hidden_size),
+        nn.ReLU(),
+        nn.Linear(hidden_size, hidden_size),
+        nn.ReLU(),
+        nn.Linear(hidden_size, output_size),
+    )
+
 
 class LatentStateModel(nn.Module):
     """Encode observations and predict a caller-owned latent state through time.
@@ -71,7 +94,7 @@ class LatentStateModel(nn.Module):
             latent_size,
             hidden_size,
         )
-        self.dynamics_model = _build_mlp(latent_size, latent_size, hidden_size)
+        self.dynamics_model = _build_mlp2(latent_size, latent_size)
         
         self.latent_state_decoder = _build_mlp(latent_size, 3, hidden_size)
 

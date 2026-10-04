@@ -214,6 +214,195 @@ class TrajectorySequenceDataset(Dataset):
         )
 
 
+class TrajectorySliceDataset(Dataset):
+    """Expose resampled fixed-width slices of complete source trajectories.
+
+    Each source trajectory contributes exactly one slice beginning at frame zero
+    and the remaining slices begin at sampled later frames. Slice starts are
+    local reset points: no preceding observation or absolute source-frame index
+    is included. Samples are padded to ``max_slice_length``; a True entry in the
+    padding mask marks a padded frame.
+
+    @param source_dataset: Complete source trajectories and their scene features.
+    @param slices_per_trajectory: Total slices produced per source trajectory.
+    @param max_slice_length: Fixed padded width and maximum real slice length.
+    @param warm_up_length: Observation count required before forecasting. A
+        sampled slice must contain at least one target after this warm-up.
+    @param sampling_seed: Seed used to derive reproducible epoch-specific starts.
+    """
+
+    source_dataset: TrajectorySequenceDataset
+
+    @staticmethod
+    def _validate_init_values(
+        source_dataset: TrajectorySequenceDataset,
+        slices_per_trajectory: int,
+        max_slice_length: int,
+        warm_up_length: int,
+        sampling_seed: int,
+    ) -> None:
+        """Validate that source trajectories can provide the requested slices."""
+        if not isinstance(source_dataset, TrajectorySequenceDataset):
+            raise TypeError("source_dataset must be a TrajectorySequenceDataset.")
+        if slices_per_trajectory < 1:
+            raise ValueError("slices_per_trajectory must be positive.")
+        if warm_up_length < 1:
+            raise ValueError("warm_up_length must be positive.")
+
+        minimum_slice_length = warm_up_length + 1
+        if max_slice_length < minimum_slice_length:
+            raise ValueError(
+                "max_slice_length must include the warm-up and one target frame."
+            )
+        if sampling_seed < 0:
+            raise ValueError("sampling_seed must be nonnegative.")
+
+        minimum_source_length = warm_up_length + slices_per_trajectory
+        too_short_indices = [
+            trajectory_index
+            for trajectory_index, trajectory in enumerate(source_dataset.trajectories)
+            if len(trajectory) < minimum_source_length
+        ]
+        if too_short_indices:
+            raise ValueError(
+                "Source trajectories do not have enough distinct valid slice starts: "
+                f"{too_short_indices}."
+            )
+
+    def __init__(
+        self,
+        source_dataset: TrajectorySequenceDataset,
+        *,
+        slices_per_trajectory: int,
+        max_slice_length: int,
+        warm_up_length: int,
+        sampling_seed: int,
+    ):
+        self._validate_init_values(
+            source_dataset,
+            slices_per_trajectory,
+            max_slice_length,
+            warm_up_length,
+            sampling_seed,
+        )
+
+        self.source_dataset = source_dataset
+        self.slices_per_trajectory = slices_per_trajectory
+        self.max_slice_length = max_slice_length
+        self.warm_up_length = warm_up_length
+        self.sampling_seed = sampling_seed
+
+        self._slice_metadata = np.empty((0, 3), dtype=np.int64)
+        self.resample_slices(epoch=0)
+
+    def resample_slices(self, epoch: int) -> None:
+        """Re-slice trajectories from stored dataset into slices - precompute 
+        slice indices so that __getitem__ just serves views into the slices one at a time.        
+
+        The one frame-zero slice per trajectory remains fixed. Validation keeps
+        its constructor-created starts by not calling this method.
+
+        @param epoch: Zero-based training epoch used with the sampling seed.
+        """
+        if epoch < 0:
+            raise ValueError("epoch must be nonnegative.")
+
+        # Deriving the generator each time (with the epoch) makes 
+        # repeated or resumed calls stable.
+        random_generator = np.random.default_rng([self.sampling_seed, epoch])
+
+        minimum_slice_length = self.warm_up_length + 1
+        slice_metadata = []
+
+        for trajectory_index, trajectory in enumerate(
+            self.source_dataset.trajectories
+        ):
+            slice_metadata.append(
+                (
+                    trajectory_index,
+                    0,
+                    min(self.max_slice_length, len(trajectory)),
+                )
+            )
+
+            later_slice_count = self.slices_per_trajectory - 1
+            if later_slice_count == 0:
+                continue
+
+            latest_start_frame = len(trajectory) - minimum_slice_length
+            later_start_frames = random_generator.choice(
+                np.arange(1, latest_start_frame + 1),
+                size=later_slice_count,
+                replace=False,
+            )
+            for start_frame in later_start_frames:
+                slice_metadata.append(
+                    (
+                        trajectory_index,
+                        int(start_frame),
+                        min(
+                            self.max_slice_length,
+                            len(trajectory) - int(start_frame),
+                        ),
+                    )
+                )
+
+        self._slice_metadata = np.asarray(slice_metadata, dtype=np.int64)
+
+    def get_slice_metadata(self) -> np.ndarray:
+        """Return source trajectory, start frame, and length for every slice.
+
+        @return: Integer array shaped (S, 3), with columns for source trajectory
+            index, inclusive source start frame, and unpadded slice length.
+        """
+        return self._slice_metadata.copy()
+
+    def __len__(self) -> int:
+        """Return the current number of trajectory slices."""
+        return len(self._slice_metadata)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, ...]:
+        """Return one fixed-width slice and its source scene information.
+
+        @param index: Index into the current epoch's slice specifications.
+
+        @return: Positions (M, 3), scene features (F,), scalar unpadded length,
+            and padding_frame_mask (M,). M is max_slice_length; True marks
+            padding and False marks an observation.
+        """
+        trajectory_index, start_frame, slice_length = (
+            int(value) for value in self._slice_metadata[index]
+        )
+
+        positions = torch.from_numpy(
+            self.source_dataset.trajectories[trajectory_index][
+                start_frame:start_frame + slice_length
+            ]
+        )
+        
+        if slice_length < self.max_slice_length:
+            padded_positions = torch.zeros(
+                (self.max_slice_length, 3),
+                dtype=positions.dtype,
+                device="cpu",
+            )
+            padded_positions[:slice_length] = positions
+            positions = padded_positions
+
+        padding_frame_mask = torch.zeros(
+            self.max_slice_length,
+            dtype=torch.bool,
+            device="cpu",
+        )
+        padding_frame_mask[slice_length:] = True
+        return (
+            positions,
+            self.source_dataset.scene_feature_tensor[trajectory_index],
+            torch.tensor(slice_length, dtype=torch.long, device="cpu"),
+            padding_frame_mask,
+        )
+
+
 def create_trajectory_dataset(world_builder,
                               seed, 
                               steps,

@@ -179,6 +179,20 @@ def main() -> None:
             axis=1,
         )
 
+        # to check scale of inputs - true a few x positions are on the order of ~1, 
+        # while others closer to .1, but not crazy
+        if False: #step < 10:
+            print(step,
+                np.array2string(
+                    actual_positions,
+                    formatter={"float_kind": lambda value: f"{value:.2f}"},
+                ),
+                np.array2string(
+                    world.scene_features,
+                    formatter={"float_kind": lambda value: f"{value:.2f}"},
+                ),
+            )
+
         if predicted_world.needs_more_warm_up():
             predicted_world.observe(actual_positions)
             if (step + 1) % args.ghost_interval == 0:

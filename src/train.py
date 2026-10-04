@@ -8,7 +8,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from sim.build_world import load_world_builder
-from training.trajectories import create_trajectory_sequence_dataset
+from training.trajectories import (
+    TrajectorySliceDataset,
+    create_trajectory_sequence_dataset,
+)
 from world_models import LatentStateModel
 
 WARMUP_LENGTH = 3  # Min 2 frames for change detection since includes the frame from which we predict; three for acceleration.
@@ -184,6 +187,7 @@ def _process_epoch_pass(
     data_loader: DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    position_weight: float,
     reconstruction_weight: float,
     consistency_weight: float,
 ) -> dict[str, float]:
@@ -197,6 +201,7 @@ def _process_epoch_pass(
     @param data_loader: Loader yielding padded trajectory batches and masks.
     @param device: Torch device receiving each batch.
     @param optimizer: Optimizer for training, or None for validation.
+    @param position_weight: Multiplier for autonomous position-prediction MSE.
     @param reconstruction_weight: Multiplier for observation reconstruction MSE.
     @param consistency_weight: Multiplier for detached-target latent MSE.
 
@@ -229,7 +234,7 @@ def _process_epoch_pass(
             padding_frame_mask, # which frame for each trajectory are real and which are just padding at end
         )
         total_loss = (
-            losses["position_loss"]
+            position_weight * losses["position_loss"]
             + reconstruction_weight * losses["reconstruction_loss"]
             + consistency_weight * losses["consistency_loss"]
         )
@@ -255,7 +260,7 @@ def _process_epoch_pass(
         for name in metric_sums
     }
     metrics["total_loss"] = (
-        metrics["position_loss"]
+        position_weight * metrics["position_loss"]
         + reconstruction_weight * metrics["reconstruction_loss"]
         + consistency_weight * metrics["consistency_loss"]
     )
@@ -410,8 +415,8 @@ def train_model(
     """Train the latent model and evaluate full autonomous validation rollouts.
 
     @param model: LatentStateModel to optimize.
-    @param train_data_loader: Loader of padded training trajectories.
-    @param validation_data_loader: Loader of padded validation trajectories.
+    @param train_data_loader: Loader of padded training trajectory slices.
+    @param validation_data_loader: Loader of fixed validation trajectory slices.
     @param config: Learning rate, epoch count, and loss weights.
     @param device: Torch device used for training and validation.
 
@@ -424,6 +429,7 @@ def train_model(
     validation_trajectory_rollouts = []
 
     for epoch in range(config["epochs"]):
+        train_data_loader.dataset.resample_slices(epoch)
         model.train()
         training_metrics.append(
             _process_epoch_pass(
@@ -431,6 +437,7 @@ def train_model(
                 train_data_loader,
                 device,
                 optimizer,
+                config["position_weight"],
                 config["reconstruction_weight"],
                 config["consistency_weight"],
             )
@@ -444,6 +451,7 @@ def train_model(
                     validation_data_loader,
                     device,
                     None,
+                    config["position_weight"],
                     config["reconstruction_weight"],
                     config["consistency_weight"],
                 )
@@ -451,7 +459,7 @@ def train_model(
             if epoch == config["epochs"] - 1:
                 validation_trajectory_rollouts = _compute_full_trajectory_rollouts(
                     model,
-                    validation_data_loader.dataset,
+                    validation_data_loader.dataset.source_dataset,
                     device,
                 )
 
@@ -467,10 +475,13 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--trajectories", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--trajectory-batch-size", type=int, default=4)
+    parser.add_argument("--slices-per-trajectory", type=int, default=4)
+    parser.add_argument("--max-slice-length", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--hidden-size", type=int, default=64)
+    parser.add_argument("--hidden-size", type=int, default=32)  # not dynamics model
     parser.add_argument("--latent-size", type=int, default=32)
     parser.add_argument("--observation-embedding-size", type=int, default=32)
+    parser.add_argument("--position-weight", type=float, default=1.0)
     parser.add_argument("--reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--consistency-weight", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
@@ -522,17 +533,28 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested, but no CUDA device is available.")
 
+    genesis_backend = gs.cpu if args.backend == "cpu" else gs.gpu
     if args.seed != 0:
         random.seed(args.seed)
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
-        gs.init(backend=gs.gpu, seed=args.seed)
+        gs.init(backend=genesis_backend, seed=args.seed)
     else:
-        gs.init(backend=gs.gpu)
+        gs.init(backend=genesis_backend)
+
+    random_generator = np.random.default_rng(None if args.seed == 0 else args.seed)
+    sampling_seeds = random_generator.integers(
+        0,
+        np.iinfo(np.int64).max,
+        size=2,
+        dtype=np.int64,
+    )
+    training_sampling_seed = int(sampling_seeds[0])
+    validation_sampling_seed = int(sampling_seeds[1])
 
     world_builder = load_world_builder(args.world_builder)
 
-    trajectories, training_dataset, validation_dataset = (
+    trajectories, training_sequence_dataset, validation_sequence_dataset = (
         create_trajectory_sequence_dataset(
             world_builder,
             args.seed,
@@ -543,7 +565,22 @@ def main() -> None:
 
     # Genesis sets PyTorch's default device to its backend during initialization.
     # Keep DataLoader indices and shuffle permutations on CPU.
+    # must be here, after gs.init and trajectory creation
     torch.set_default_device("cpu")
+    training_dataset = TrajectorySliceDataset(
+        training_sequence_dataset,
+        slices_per_trajectory=args.slices_per_trajectory,
+        max_slice_length=args.max_slice_length,
+        warm_up_length=WARMUP_LENGTH,
+        sampling_seed=training_sampling_seed,
+    )
+    validation_dataset = TrajectorySliceDataset(
+        validation_sequence_dataset,
+        slices_per_trajectory=args.slices_per_trajectory,
+        max_slice_length=args.max_slice_length,
+        warm_up_length=WARMUP_LENGTH,
+        sampling_seed=validation_sampling_seed,
+    )
     training_loader = DataLoader(
         training_dataset,
         batch_size=args.trajectory_batch_size,
@@ -564,6 +601,7 @@ def main() -> None:
     config = {
         "lr": args.learning_rate,
         "epochs": args.epochs,
+        "position_weight": args.position_weight,
         "reconstruction_weight": args.reconstruction_weight,
         "consistency_weight": args.consistency_weight,
     }
@@ -588,9 +626,17 @@ def main() -> None:
         "state_dict": model.state_dict(),
         "training_metadata": {
             "prediction_horizon": PREDICTION_HORIZON,
+            "position_weight": args.position_weight,
             "reconstruction_weight": args.reconstruction_weight,
             "consistency_weight": args.consistency_weight,
             "trajectory_batch_size": args.trajectory_batch_size,
+            "slices_per_trajectory": args.slices_per_trajectory,
+            "max_slice_length": args.max_slice_length,
+            "training_sampling_seed": training_sampling_seed,
+            "validation_sampling_seed": validation_sampling_seed,
+            "validation_slice_metadata": (
+                validation_dataset.get_slice_metadata().tolist()
+            ),
         },
     }
     saved_metrics = {
@@ -614,8 +660,8 @@ def main() -> None:
 
     saved_scene_features = torch.cat(
         [
-            training_dataset.scene_feature_tensor,
-            validation_dataset.scene_feature_tensor,
+            training_sequence_dataset.scene_feature_tensor,
+            validation_sequence_dataset.scene_feature_tensor,
         ]
     ).cpu().numpy()
     np.savez(

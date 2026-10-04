@@ -21,9 +21,10 @@ from train import (
     _compute_observation_states,
     _roll_out_model,
     _compute_consistency_error_sum,
+    _process_epoch_pass,
     get_args as get_training_args,
 )
-from training import TrajectorySequenceDataset
+from training import TrajectorySequenceDataset, TrajectorySliceDataset
 from world_models import LatentStateModel, PositionHistoryMLP
 
 
@@ -132,6 +133,92 @@ class LatentStateTest(unittest.TestCase):
         torch.testing.assert_close(positions[0, :2], torch.ones((2, 3)))
         torch.testing.assert_close(positions[0, 2:], torch.zeros((3, 3)))
         np.testing.assert_array_equal(dataset.trajectories[0], short_trajectory)
+
+    def test_trajectory_slices_include_frame_zero_and_pad_short_tails(self):
+        trajectory = np.arange(21, dtype=np.float32).reshape(7, 3)
+        source_dataset = TrajectorySequenceDataset(
+            [trajectory],
+            np.asarray([[2.0, 3.0]], dtype=np.float32),
+        )
+        dataset = TrajectorySliceDataset(
+            source_dataset,
+            slices_per_trajectory=5,
+            max_slice_length=6,
+            warm_up_length=2,
+            sampling_seed=7,
+        )
+
+        metadata = dataset.get_slice_metadata()
+        self.assertEqual(metadata.shape, (5, 3))
+        np.testing.assert_array_equal(metadata[0], np.asarray([0, 0, 6]))
+        self.assertEqual(set(metadata[:, 1]), {0, 1, 2, 3, 4})
+
+        full_positions = dataset[0][0]
+        self.assertTrue(np.shares_memory(full_positions.numpy(), trajectory))
+        batched_positions = next(iter(DataLoader(dataset, batch_size=5)))[0]
+        self.assertEqual(batched_positions.shape, (5, 6, 3))
+
+        tail_index = int(np.flatnonzero(metadata[:, 1] == 4)[0])
+        positions, features, length, padding_frame_mask = dataset[tail_index]
+        self.assertEqual(length.item(), 3)
+        torch.testing.assert_close(positions[:3], torch.from_numpy(trajectory[4:]))
+        torch.testing.assert_close(positions[3:], torch.zeros((3, 3)))
+        torch.testing.assert_close(features, torch.tensor([2.0, 3.0]))
+        torch.testing.assert_close(
+            padding_frame_mask,
+            torch.tensor([False, False, False, True, True, True]),
+        )
+
+    def test_trajectory_slice_resampling_is_epoch_deterministic(self):
+        trajectory = np.arange(60, dtype=np.float32).reshape(20, 3)
+        source_dataset = TrajectorySequenceDataset(
+            [trajectory],
+            np.zeros((1, 2), dtype=np.float32),
+        )
+        dataset = TrajectorySliceDataset(
+            source_dataset,
+            slices_per_trajectory=4,
+            max_slice_length=8,
+            warm_up_length=3,
+            sampling_seed=11,
+        )
+        epoch_zero_metadata = dataset.get_slice_metadata()
+
+        dataset.resample_slices(epoch=1)
+        epoch_one_metadata = dataset.get_slice_metadata()
+        repeated_dataset = TrajectorySliceDataset(
+            source_dataset,
+            slices_per_trajectory=4,
+            max_slice_length=8,
+            warm_up_length=3,
+            sampling_seed=11,
+        )
+        repeated_dataset.resample_slices(epoch=1)
+
+        np.testing.assert_array_equal(
+            epoch_one_metadata,
+            repeated_dataset.get_slice_metadata(),
+        )
+        self.assertFalse(np.array_equal(epoch_zero_metadata, epoch_one_metadata))
+        np.testing.assert_array_equal(epoch_one_metadata[0], np.asarray([0, 0, 8]))
+
+        epoch_one_metadata[0, 1] = 5
+        self.assertEqual(dataset.get_slice_metadata()[0, 1], 0)
+
+    def test_trajectory_slices_require_distinct_valid_later_starts(self):
+        source_dataset = TrajectorySequenceDataset(
+            [np.zeros((6, 3), dtype=np.float32)],
+            np.zeros((1, 2), dtype=np.float32),
+        )
+
+        with self.assertRaisesRegex(ValueError, "distinct valid slice starts"):
+            TrajectorySliceDataset(
+                source_dataset,
+                slices_per_trajectory=4,
+                max_slice_length=6,
+                warm_up_length=3,
+                sampling_seed=1,
+            )
 
     def test_checkpoint_dispatch_keeps_model_types_distinct(self):
         latent_model = LatentStateModel(
@@ -354,6 +441,33 @@ class LatentStateTest(unittest.TestCase):
         self.assertTrue(
             any(parameter.grad is not None for parameter in model.state_updater.parameters())
         )
+
+    def test_zero_position_weight_excludes_position_loss_from_total(self):
+        """Keep reporting forecast error when reconstruction is the sole objective."""
+        dataset = TrajectorySequenceDataset(
+            [np.arange(12, dtype=np.float32).reshape(4, 3)],
+            np.zeros((1, 2), dtype=np.float32),
+        )
+        model = LatentStateModel(
+            latent_size=4,
+            observation_embedding_size=3,
+            hidden_size=8,
+            scene_feature_size=2,
+            warm_up_length=3,
+        )
+
+        metrics = _process_epoch_pass(
+            model,
+            DataLoader(dataset, batch_size=1),
+            torch.device("cpu"),
+            None,
+            0.0,
+            1.0,
+            0.0,
+        )
+
+        self.assertGreater(metrics["position_loss"], 0.0)
+        self.assertEqual(metrics["total_loss"], metrics["reconstruction_loss"])
 
     def test_training_and_prediction_world_rollouts_match(self):
         torch.manual_seed(4)
