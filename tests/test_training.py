@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import numpy as np
 import torch
@@ -125,13 +125,16 @@ class TrainingTest(unittest.TestCase):
         self.assertEqual(len(trajectories[0]), 6)
         self.assertEqual(len(trajectories[1]), 8)
 
-    def test_create_trajectory_dataset_splits_trajectories_80_20(self):
+    def test_create_trajectory_dataset_rounds_up_and_splits_complete_scenes(self):
         trajectories = [
             np.full((10, 3), trajectory_index, dtype=np.float32)
-            for trajectory_index in range(10)
+            for trajectory_index in range(12)
         ]
         scene_features = np.stack(
-            [np.full(10, trajectory_index, dtype=np.float32) for trajectory_index in range(10)]
+            [
+                np.full(10, trajectory_index // 4, dtype=np.float32)
+                for trajectory_index in range(12)
+            ]
         )
 
         with patch("training.trajectories.SimulationTrajectoryCollector") as collector_type:
@@ -149,7 +152,13 @@ class TrainingTest(unittest.TestCase):
 
         self.assertIs(collected, trajectories)
         self.assertEqual(len(training_dataset.datasets), 8)
-        self.assertEqual(len(validation_dataset.datasets), 2)
+        self.assertEqual(len(validation_dataset.datasets), 4)
+        collector_type.return_value.collect_randomized_batch.assert_called_once_with(
+            6,
+            n_environments=12,
+            random_generator=ANY,
+            trajectories_per_scene=4,
+        )
         np.testing.assert_array_equal(
             training_dataset.datasets[-1].scene_features,
             scene_features[7],

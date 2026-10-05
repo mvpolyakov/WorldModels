@@ -18,6 +18,7 @@ from sim.scene_features import (
 from sim.utilities.sim_utils import PredictionWorld
 from train import (
     _compute_batch_losses,
+    _compute_gradient_norm,
     _compute_observation_states,
     _roll_out_model,
     _compute_consistency_error_sum,
@@ -316,6 +317,84 @@ class LatentStateTest(unittest.TestCase):
         torch.testing.assert_close(starting_state, saved_starting_state)
         torch.testing.assert_close(first_branch, second_branch)
 
+    def test_latent_decoder_returns_absolute_position(self):
+        model = LatentStateModel(
+            latent_size=2,
+            observation_embedding_size=2,
+            hidden_size=4,
+            scene_feature_size=1,
+        )
+        with torch.no_grad():
+            for parameter in model.latent_state_decoder.parameters():
+                parameter.zero_()
+            model.latent_state_decoder[-1].bias.copy_(
+                torch.tensor([0.5, -0.5, 1.0])
+            )
+
+        predicted_position = model.decode_state(torch.zeros((1, 2)))
+
+        torch.testing.assert_close(
+            predicted_position,
+            torch.tensor([[0.5, -0.5, 1.0]]),
+        )
+
+    def test_latent_rollout_uses_decoded_absolute_positions(self):
+        model = LatentStateModel(
+            latent_size=2,
+            observation_embedding_size=2,
+            hidden_size=4,
+            scene_feature_size=1,
+            warm_up_length=3,
+        )
+        with torch.no_grad():
+            for parameter in model.latent_state_decoder.parameters():
+                parameter.zero_()
+            model.latent_state_decoder[-1].bias.copy_(
+                torch.tensor([0.5, -0.5, 1.0])
+            )
+
+        predicted_positions = _roll_out_model(
+            model,
+            np.asarray(
+                [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [2.0, 2.0, 2.0]],
+                dtype=np.float32,
+            ),
+            np.zeros((1, 1), dtype=np.float32),
+            prediction_count=3,
+            device=torch.device("cpu"),
+        )
+
+        torch.testing.assert_close(
+            predicted_positions,
+            torch.tensor(
+                [[[0.5, -0.5, 1.0], [0.5, -0.5, 1.0], [0.5, -0.5, 1.0]]]
+            ),
+        )
+
+    def test_constant_position_decoder_reconstructs_and_forecasts_static_motion(self):
+        model = LatentStateModel(
+            latent_size=2,
+            observation_embedding_size=2,
+            hidden_size=4,
+            scene_feature_size=1,
+            warm_up_length=3,
+        )
+        with torch.no_grad():
+            for parameter in model.latent_state_decoder.parameters():
+                parameter.zero_()
+            model.latent_state_decoder[-1].bias.fill_(1.0)
+        positions = torch.ones((1, 5, 3))
+
+        losses = _compute_batch_losses(
+            model,
+            positions,
+            torch.zeros((1, 1)),
+            torch.zeros((1, 5), dtype=torch.bool),
+        )
+
+        self.assertEqual(losses["reconstruction_loss"].item(), 0.0)
+        self.assertEqual(losses["position_loss"].item(), 0.0)
+
     def test_padding_is_excluded_from_updates_and_losses(self):
         dataset = TrajectorySequenceDataset(
             [
@@ -456,6 +535,7 @@ class LatentStateTest(unittest.TestCase):
             warm_up_length=3,
         )
 
+        batch_metrics = []
         metrics = _process_epoch_pass(
             model,
             DataLoader(dataset, batch_size=1),
@@ -464,10 +544,58 @@ class LatentStateTest(unittest.TestCase):
             0.0,
             1.0,
             0.0,
+            batch_metrics,
         )
 
         self.assertGreater(metrics["position_loss"], 0.0)
         self.assertEqual(metrics["total_loss"], metrics["reconstruction_loss"])
+        self.assertEqual(len(batch_metrics), 1)
+        self.assertEqual(batch_metrics[0]["total_loss"], metrics["total_loss"])
+        self.assertNotIn("gradient_norm", batch_metrics[0])
+
+    def test_training_batch_metrics_include_pre_step_gradient_norms(self):
+        dataset = TrajectorySequenceDataset(
+            [np.arange(12, dtype=np.float32).reshape(4, 3)],
+            np.zeros((1, 2), dtype=np.float32),
+        )
+        model = LatentStateModel(
+            latent_size=4,
+            observation_embedding_size=3,
+            hidden_size=8,
+            scene_feature_size=2,
+            warm_up_length=3,
+        )
+        batch_metrics = []
+
+        _process_epoch_pass(
+            model,
+            DataLoader(dataset, batch_size=1),
+            torch.device("cpu"),
+            torch.optim.Adam(model.parameters(), lr=0.0),
+            1.0,
+            1.0,
+            0.1,
+            batch_metrics,
+        )
+
+        self.assertEqual(len(batch_metrics), 1)
+        for name in (
+            "gradient_norm",
+            "observation_encoder_gradient_norm",
+            "state_updater_gradient_norm",
+            "dynamics_model_gradient_norm",
+            "latent_state_decoder_gradient_norm",
+        ):
+            self.assertGreaterEqual(batch_metrics[0][name], 0.0)
+
+    def test_gradient_norm_combines_parameter_gradients(self):
+        first = torch.nn.Parameter(torch.tensor([0.0]))
+        second = torch.nn.Parameter(torch.tensor([0.0]))
+        unused = torch.nn.Parameter(torch.tensor([0.0]))
+        first.grad = torch.tensor([3.0])
+        second.grad = torch.tensor([4.0])
+
+        self.assertEqual(_compute_gradient_norm([first, second, unused]), 5.0)
 
     def test_training_and_prediction_world_rollouts_match(self):
         torch.manual_seed(4)

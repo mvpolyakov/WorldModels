@@ -18,6 +18,31 @@ from sim.utilities.viz_utils import draw_ground_coordinate_lines
 
 
 class SceneRandomizationTest(unittest.TestCase):
+    def test_simple_rolling_uses_four_release_positions_per_scene(self):
+        world_builder = SimpleRollingWorldBuilder()
+        ramp_positions, ramp_eulers, ball_positions, _ = (
+            world_builder._create_randomized_rolling_values(
+                np.random.default_rng(5),
+                n_environments=8,
+                trajectories_per_scene=4,
+            )
+        )
+
+        for scene_start in (0, 4):
+            scene_stop = scene_start + 4
+            np.testing.assert_allclose(
+                ramp_positions[scene_start:scene_stop],
+                np.repeat(ramp_positions[scene_start:scene_start + 1], 4, axis=0),
+            )
+            np.testing.assert_allclose(
+                ramp_eulers[scene_start:scene_stop],
+                np.repeat(ramp_eulers[scene_start:scene_start + 1], 4, axis=0),
+            )
+            self.assertEqual(
+                len(np.unique(ball_positions[scene_start:scene_stop], axis=0)),
+                4,
+            )
+
     def test_randomized_scene_translates_ramp_and_ball_together(self):
         world_builder = SimpleRollingWorldBuilder()
         ramp_positions, ramp_eulers, ball_positions, _ = (
@@ -184,6 +209,39 @@ class SceneRandomizationTest(unittest.TestCase):
 
 
 class OpposingRampsRandomizationTest(unittest.TestCase):
+    def test_four_releases_share_each_scene_but_have_distinct_ball_positions(self):
+        world_builder = OpposingRampsWorldBuilder()
+        randomized_values = world_builder._create_randomized_opposing_ramp_values(
+            np.random.default_rng(12),
+            n_environments=8,
+            trajectories_per_scene=4,
+        )
+        scene_value_arrays = (
+            randomized_values[0],
+            randomized_values[1],
+            randomized_values[2],
+            randomized_values[3],
+            randomized_values[5],
+            randomized_values[6],
+        )
+        ball_positions = randomized_values[4]
+
+        for scene_start in (0, 4):
+            scene_stop = scene_start + 4
+            for scene_values in scene_value_arrays:
+                np.testing.assert_allclose(
+                    scene_values[scene_start:scene_stop],
+                    np.repeat(
+                        scene_values[scene_start:scene_start + 1],
+                        4,
+                        axis=0,
+                    ),
+                )
+            self.assertEqual(
+                len(np.unique(ball_positions[scene_start:scene_stop], axis=0)),
+                4,
+            )
+
     def test_randomized_ramps_have_a_gap_and_ball_starts_on_one_surface(self):
         world_builder = OpposingRampsWorldBuilder()
         (
@@ -284,6 +342,8 @@ class OpposingRampsRandomizationTest(unittest.TestCase):
 
         ball_radius = world_builder.ball_config.morph_params["radius"]
         surface_clearance = ball_radius + world_builder.ball_clearance
+        self.assertGreater(world_builder.ball_clearance, 0.0)
+        self.assertLessEqual(world_builder.ball_clearance, 1e-4)
         minimum_release_distance = max(
             surface_clearance,
             ramp_length * world_builder.minimum_release_distance_fraction,

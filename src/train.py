@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -116,9 +117,11 @@ def _compute_batch_losses(
     # Decode each observation-updated state to train the encoder and updater.
     # Flatten trajectory/time axes for the decoder, then restore the frame layout.
     reconstructed_positions = model.decode_state(
-        observation_states.reshape(batch_size * padded_frame_count, model.latent_size)
+        observation_states.reshape(
+            batch_size * padded_frame_count,
+            model.latent_size,
+        )
     ).reshape(batch_size, padded_frame_count, position_size)
-
     reconstruction_error_sum = torch.sum(
         (reconstructed_positions - observed_positions) ** 2
         * (~padding_frame_mask).unsqueeze(-1)
@@ -182,6 +185,77 @@ def _compute_batch_losses(
     }
 
 
+def _compute_gradient_norm(parameters: Iterable[torch.nn.Parameter]) -> float:
+    """Compute the combined L2 norm of the available parameter gradients.
+
+    @param parameters: Model parameters whose gradients will be measured. Parameters
+        without a gradient are excluded.
+
+    @return: The scalar L2 norm across all supplied gradients.
+    """
+    parameter_gradient_norms = [
+        parameter.grad.detach().norm(2)
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not parameter_gradient_norms:
+        return 0.0
+    return torch.stack(parameter_gradient_norms).norm(2).item()
+
+
+def _build_batch_metrics(
+    losses: dict[str, torch.Tensor | int],
+    total_loss: torch.Tensor,
+    model: LatentStateModel,
+    *,
+    include_gradient_norms: bool,
+) -> dict[str, float | int]:
+    """Build one persisted batch record from losses and post-backward gradients.
+
+    Loss records include each loss, latent standard deviation, total loss, and the
+    element counts used by epoch aggregation. Training records additionally include
+    the full-model gradient norm and separate norms for the observation encoder,
+    state updater, dynamics model, and latent-state decoder.
+
+    @param losses: Batch loss tensors and their aggregation counts.
+    @param total_loss: Weighted scalar loss used for backpropagation.
+    @param model: Model whose component gradients may be recorded.
+    @param include_gradient_norms: Whether to append post-backward gradient norms.
+
+    @return: JSON-serializable metrics for one batch.
+    """
+    batch_metrics = {
+        "position_loss": losses["position_loss"].item(),
+        "reconstruction_loss": losses["reconstruction_loss"].item(),
+        "consistency_loss": losses["consistency_loss"].item(),
+        "latent_std": losses["latent_std"].item(),
+        "total_loss": total_loss.item(),
+        "position_element_count": losses["position_element_count"],
+        "reconstruction_element_count": losses["reconstruction_element_count"],
+        "consistency_element_count": losses["consistency_element_count"],
+        "observed_frame_count": losses["observed_frame_count"],
+    }
+    if include_gradient_norms:
+        batch_metrics.update(
+            {
+                "gradient_norm": _compute_gradient_norm(model.parameters()),
+                "observation_encoder_gradient_norm": _compute_gradient_norm(
+                    model.observation_encoder.parameters()
+                ),
+                "state_updater_gradient_norm": _compute_gradient_norm(
+                    model.state_updater.parameters()
+                ),
+                "dynamics_model_gradient_norm": _compute_gradient_norm(
+                    model.dynamics_model.parameters()
+                ),
+                "latent_state_decoder_gradient_norm": _compute_gradient_norm(
+                    model.latent_state_decoder.parameters()
+                ),
+            }
+        )
+    return batch_metrics
+
+
 def _process_epoch_pass(
     model: LatentStateModel,
     data_loader: DataLoader,
@@ -190,6 +264,7 @@ def _process_epoch_pass(
     position_weight: float,
     reconstruction_weight: float,
     consistency_weight: float,
+    batch_metrics: list[dict[str, float | int]] | None = None,
 ) -> dict[str, float]:
     """Run one training or validation pass over trajectory batches.
 
@@ -204,6 +279,7 @@ def _process_epoch_pass(
     @param position_weight: Multiplier for autonomous position-prediction MSE.
     @param reconstruction_weight: Multiplier for observation reconstruction MSE.
     @param consistency_weight: Multiplier for detached-target latent MSE.
+    @param batch_metrics: Optional destination for one diagnostic record per batch.
 
     @return: Dictionary of mean losses, latent standard deviation, and total loss.
     """
@@ -243,6 +319,16 @@ def _process_epoch_pass(
             raise RuntimeError(f"{pass_name} loss became non-finite.")
         if optimizer is not None:
             total_loss.backward()
+        if batch_metrics is not None:
+            batch_metrics.append(
+                _build_batch_metrics(
+                    losses,
+                    total_loss,
+                    model,
+                    include_gradient_norms=optimizer is not None,
+                )
+            )
+        if optimizer is not None:
             optimizer.step()
 
         counts = {
@@ -420,17 +506,20 @@ def train_model(
     @param config: Learning rate, epoch count, and loss weights.
     @param device: Torch device used for training and validation.
 
-    @return: Per-epoch training metrics, per-epoch validation metrics, and final
-        full-trajectory validation rollout dictionaries.
+    @return: Per-epoch training metrics, per-epoch validation metrics, final
+        full-trajectory validation rollouts, and per-epoch batch diagnostics.
     """
     optimizer = torch.optim.Adam(model.parameters(), config["lr"])
     training_metrics = []
     validation_metrics = []
+    training_batch_metrics = []
+    validation_batch_metrics = []
     validation_trajectory_rollouts = []
 
     for epoch in range(config["epochs"]):
         train_data_loader.dataset.resample_slices(epoch)
         model.train()
+        epoch_training_batch_metrics = []
         training_metrics.append(
             _process_epoch_pass(
                 model,
@@ -440,11 +529,14 @@ def train_model(
                 config["position_weight"],
                 config["reconstruction_weight"],
                 config["consistency_weight"],
+                epoch_training_batch_metrics,
             )
         )
+        training_batch_metrics.append(epoch_training_batch_metrics)
 
         model.eval()
         with torch.inference_mode():
+            epoch_validation_batch_metrics = []
             validation_metrics.append(
                 _process_epoch_pass(
                     model,
@@ -454,8 +546,10 @@ def train_model(
                     config["position_weight"],
                     config["reconstruction_weight"],
                     config["consistency_weight"],
+                    epoch_validation_batch_metrics,
                 )
             )
+            validation_batch_metrics.append(epoch_validation_batch_metrics)
             if epoch == config["epochs"] - 1:
                 validation_trajectory_rollouts = _compute_full_trajectory_rollouts(
                     model,
@@ -466,7 +560,16 @@ def train_model(
         if epoch % 2 == 0:
             print("epoch", epoch)
 
-    return training_metrics, validation_metrics, validation_trajectory_rollouts
+    batch_metrics = {
+        "training": training_batch_metrics,
+        "validation": validation_batch_metrics,
+    }
+    return (
+        training_metrics,
+        validation_metrics,
+        validation_trajectory_rollouts,
+        batch_metrics,
+    )
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a latent-state world model.")
@@ -605,14 +708,17 @@ def main() -> None:
         "reconstruction_weight": args.reconstruction_weight,
         "consistency_weight": args.consistency_weight,
     }
-    training_metrics, validation_metrics, validation_trajectory_rollouts = (
-        train_model(
-            model,
-            training_loader,
-            validation_loader,
-            config,
-            device,
-        )
+    (
+        training_metrics,
+        validation_metrics,
+        validation_trajectory_rollouts,
+        batch_metrics,
+    ) = train_model(
+        model,
+        training_loader,
+        validation_loader,
+        config,
+        device,
     )
     checkpoint = {
         "model_type": "LatentStateModel",
@@ -642,6 +748,8 @@ def main() -> None:
     saved_metrics = {
         "training": training_metrics,
         "validation": validation_metrics,
+        "training_batches": batch_metrics["training"],
+        "validation_batches": batch_metrics["validation"],
     }
 
     output_dir = Path('artifacts/runs')

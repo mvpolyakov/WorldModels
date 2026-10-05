@@ -10,6 +10,29 @@ from sim.build_world import WorldBuilder
 
 #MIN_MOVEMENT = 0.001 # min object displacement to keep collecting trajectory
 MIN_MOVEMENT = 0 # actually do want to have samples of near static objects - this pretty much eliminates it
+TRAJECTORIES_PER_SCENE = 8
+
+
+def _round_up_trajectory_count(n_trajectories: int) -> int:
+    """Round a requested trajectory count up to a complete scene group."""
+    if n_trajectories < 2:
+        raise ValueError(
+            "At least 2 trajectories are required for training and validation."
+        )
+    return (
+        (n_trajectories + TRAJECTORIES_PER_SCENE - 1)
+        // TRAJECTORIES_PER_SCENE
+        * TRAJECTORIES_PER_SCENE
+    )
+
+
+def _get_training_trajectory_count(n_trajectories: int) -> int:
+    """Choose a split boundary that keeps scene groups intact when possible."""
+    scene_count = n_trajectories // TRAJECTORIES_PER_SCENE
+    if scene_count == 1:
+        return n_trajectories - 1
+    validation_scene_count = max(1, scene_count // 5)
+    return (scene_count - validation_scene_count) * TRAJECTORIES_PER_SCENE
 
 class SimulationTrajectoryCollector:
     """Collect ball-position trajectories from a batched Genesis world.
@@ -28,6 +51,7 @@ class SimulationTrajectoryCollector:
         steps: int,
         n_environments: int,
         random_generator: np.random.Generator,
+        trajectories_per_scene: int = 1,
     ) -> tuple[list[np.ndarray], np.ndarray]:
         """Collect trajectories and their static ramp/radius features."""
         if steps < 5:
@@ -38,6 +62,7 @@ class SimulationTrajectoryCollector:
             n_environments=n_environments,
             ghost_count=0,
             random_generator=random_generator,
+            trajectories_per_scene=trajectories_per_scene,
         )
 
         positions_by_step = [
@@ -413,8 +438,7 @@ def create_trajectory_dataset(world_builder,
     create n_trajectories randomized rollouts for teaching a model basic rolling physics
     '''
 
-    if n_trajectories < 2:
-        raise ValueError("At least 2 trajectories are required for training and validation.")
+    n_trajectories = _round_up_trajectory_count(n_trajectories)
 
     random_generator = np.random.default_rng(None if seed == 0 else seed)
     trajectories, scene_features = SimulationTrajectoryCollector(
@@ -424,9 +448,10 @@ def create_trajectory_dataset(world_builder,
         # 1 trajectory per environment
         n_environments=n_trajectories,
         random_generator=random_generator,
+        trajectories_per_scene=TRAJECTORIES_PER_SCENE,
     )
-    validation_trajectory_count = max(1, n_trajectories // 5)
-    training_trajectory_count = n_trajectories - validation_trajectory_count
+    # computes the train/validation split too
+    training_trajectory_count = _get_training_trajectory_count(n_trajectories)
 
     training_trajectory_datasets = [
         PositionHistoryDataset(
@@ -468,19 +493,20 @@ def create_trajectory_sequence_dataset(
 ):
     """Collect simulator trajectories and split them without splitting sequences.
 
-    20 percent of trajectories (at least one), are reserved for
-    validation. Each split pads its trajectories once to its own maximum length.
+    Approximately 20 percent of complete scenes are reserved for validation,
+    without dividing four-trajectory scene groups when multiple scenes exist.
+    Each split pads its trajectories once to its own maximum length.
 
     @param world_builder: Builder used to create the randomized simulation batch.
     @param seed: Randomization seed; zero requests nondeterministic collection.
     @param steps: Maximum simulator steps collected per trajectory.
-    @param n_trajectories: Number of randomized environments to collect.
+    @param n_trajectories: Requested trajectory count, rounded up to a multiple
+        of four.
 
     @return: All raw position arrays, the training TrajectorySequenceDataset,
         and the validation TrajectorySequenceDataset.
     """
-    if n_trajectories < 2:
-        raise ValueError("At least 2 trajectories are required for training and validation.")
+    n_trajectories = _round_up_trajectory_count(n_trajectories)
 
     random_generator = np.random.default_rng(None if seed == 0 else seed)
     trajectories, scene_features = SimulationTrajectoryCollector(
@@ -489,9 +515,9 @@ def create_trajectory_sequence_dataset(
         steps,
         n_environments=n_trajectories,
         random_generator=random_generator,
+        trajectories_per_scene=TRAJECTORIES_PER_SCENE,
     )
-    validation_trajectory_count = max(1, n_trajectories // 5)
-    training_trajectory_count = n_trajectories - validation_trajectory_count
+    training_trajectory_count = _get_training_trajectory_count(n_trajectories)
 
     training_dataset = TrajectorySequenceDataset(
         trajectories[:training_trajectory_count],

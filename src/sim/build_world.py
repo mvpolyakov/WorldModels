@@ -40,6 +40,20 @@ class WorldBuilder(ABC):
     scene_feature_size: int
 
     @staticmethod
+    def _get_randomized_scene_count(
+        n_environments: int,
+        trajectories_per_scene: int,
+    ) -> int:
+        """Validate grouped randomization and return the distinct scene count."""
+        if trajectories_per_scene < 1:
+            raise ValueError("trajectories_per_scene must be positive.")
+        if n_environments % trajectories_per_scene != 0:
+            raise ValueError(
+                "n_environments must be divisible by trajectories_per_scene."
+            )
+        return n_environments // trajectories_per_scene
+
+    @staticmethod
     def _add_object(scene, obj: ObjectConfig):
         """Add a single ObjectConfig to the scene and return the entity."""
         morph_cls = _MORPH_MAP.get(obj.morph_type)
@@ -166,6 +180,7 @@ class WorldBuilder(ABC):
         n_environments: int = 1,
         ghost_count: int = 0,
         random_generator: np.random.Generator | None = None,
+        trajectories_per_scene: int = 1,
     ) -> tuple[World, Optional[TrajectoryRecorder]]:
         """Build and configure a world for a specific scenario."""
 
@@ -192,20 +207,43 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         self,
         random_generator: np.random.Generator,
         n_environments: int,
+        trajectories_per_scene: int = 1,
     ) -> tuple:
         """Create randomized rolling values from the scene configuration."""
 
-        # Each randomized property has one value per environment: (n_environments,).
-        friction_values = random_generator.uniform(0.1, 1.0, n_environments)
-        ramp_angle_degrees = random_generator.uniform(10.0, 30.0, n_environments)
+        scene_count = self._get_randomized_scene_count(
+            n_environments,
+            trajectories_per_scene,
+        )
+        friction_values = np.repeat(
+            random_generator.uniform(0.1, 1.0, scene_count),
+            trajectories_per_scene,
+        )
+        ramp_angle_degrees = np.repeat(
+            random_generator.uniform(10.0, 30.0, scene_count),
+            trajectories_per_scene,
+        )
         ramp_angle_radians = np.deg2rad(ramp_angle_degrees)
-        ramp_direction_degrees = random_generator.uniform(-180.0, 180.0, n_environments)
+        ramp_direction_degrees = np.repeat(
+            random_generator.uniform(-180.0, 180.0, scene_count),
+            trajectories_per_scene,
+        )
         ramp_direction_radians = np.deg2rad(ramp_direction_degrees)
-        distance_up_ramp_fractions = random_generator.uniform(0.55, 0.9, n_environments)
-        scene_lateral_translations = random_generator.uniform(
-            -2,
-            2,
-            (n_environments, 2),
+        if trajectories_per_scene == 4:
+            distance_up_ramp_fractions = np.tile(
+                np.linspace(0.55, 0.9, trajectories_per_scene),
+                scene_count,
+            )
+        else:
+            distance_up_ramp_fractions = random_generator.uniform(
+                0.55,
+                0.9,
+                n_environments,
+            )
+        scene_lateral_translations = np.repeat(
+            random_generator.uniform(-2, 2, (scene_count, 2)),
+            trajectories_per_scene,
+            axis=0,
         )
 
         ramp_length, _, ramp_thickness = self.ramp_config.morph_params["size"]
@@ -239,7 +277,7 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         ).astype(np.float32)
 
         distances_up_ramp = ramp_length * distance_up_ramp_fractions
-        ball_clearance = 0.01
+        ball_clearance = 1e-4
         ball_radius = self.ball_config.morph_params["radius"]
         distance_above_ramp_center = ramp_half_thickness + ball_radius + ball_clearance
         ball_horizontal_offsets = (
@@ -286,13 +324,15 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         world,
         random_generator: np.random.Generator,
         n_environments: int,
+        trajectories_per_scene: int = 1,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Apply independent randomized values to a batched Genesis world."""
+        """Apply grouped scene values and distinct releases to a batched world."""
 
         ramp_positions, ramp_eulers, ball_positions, friction_values = (
             self._create_randomized_rolling_values(
                 random_generator,
                 n_environments,
+                trajectories_per_scene,
             )
         )
 
@@ -369,6 +409,7 @@ class SimpleRollingWorldBuilder(WorldBuilder):
         n_environments: int = 1,
         ghost_count: int = 0,
         random_generator: np.random.Generator | None = None,
+        trajectories_per_scene: int = 1,
     ) -> tuple[World, Optional[TrajectoryRecorder]]:
         """Scaffold and configure a simple rolling world."""
 
@@ -383,6 +424,7 @@ class SimpleRollingWorldBuilder(WorldBuilder):
                 world,
                 random_generator,
                 n_environments,
+                trajectories_per_scene,
             )
             scene_transform = self._compute_scene_transform(
                 ramp_positions[0],
@@ -412,7 +454,7 @@ class OpposingRampsWorldBuilder(WorldBuilder):
     maximum_gap_width_fraction = 0.5
     maximum_relative_yaw_degrees = 30.0 # rotation in the xy plane
     minimum_gap_clearance = 0.05
-    ball_clearance = 0.01
+    ball_clearance = 1e-4
     escape_height_margin = 0.02
     minimum_release_distance_fraction = 0.25
 
@@ -501,6 +543,7 @@ class OpposingRampsWorldBuilder(WorldBuilder):
         self,
         random_generator: np.random.Generator,
         n_environments: int,
+        trajectories_per_scene: int = 1,
     ) -> tuple[
         np.ndarray,
         np.ndarray,
@@ -510,7 +553,7 @@ class OpposingRampsWorldBuilder(WorldBuilder):
         np.ndarray,
         np.ndarray,
     ]:
-        """Create paired ramp poses and valid ball releases for each environment."""
+        """Create grouped ramp scenes and valid ball releases for each trajectory."""
         if n_environments < 1:
             raise ValueError("n_environments must be positive.")
         if (
@@ -519,24 +562,43 @@ class OpposingRampsWorldBuilder(WorldBuilder):
         ):
             raise ValueError("Opposing ramps must have matching dimensions.")
 
-        ramp_angles = random_generator.uniform(
-            self.minimum_ramp_angle_degrees,
-            self.maximum_ramp_angle_degrees,
-            (n_environments, 2),
-        ).astype(np.float32)
-        common_yaws = random_generator.uniform(
-            -180.0, 180.0, n_environments
-        ).astype(np.float32)
-        yaw_offsets = random_generator.uniform(
-            -self.maximum_relative_yaw_degrees / 2.0,
-            self.maximum_relative_yaw_degrees / 2.0,
-            (n_environments, 2),
-        ).astype(np.float32)
-        scene_translations = random_generator.uniform(
-            -self.maximum_scene_translation,
-            self.maximum_scene_translation,
-            (n_environments, 2),
-        ).astype(np.float32)
+        # Generate trajectories_per_scene number of each scene component
+
+        scene_count = self._get_randomized_scene_count(
+            n_environments,
+            trajectories_per_scene,
+        )
+        ramp_angles = np.repeat(
+            random_generator.uniform(
+                self.minimum_ramp_angle_degrees,
+                self.maximum_ramp_angle_degrees,
+                (scene_count, 2),
+            ).astype(np.float32),
+            trajectories_per_scene,
+            axis=0,
+        )
+        common_yaws = np.repeat(
+            random_generator.uniform(-180.0, 180.0, scene_count).astype(np.float32),
+            trajectories_per_scene,
+        )
+        yaw_offsets = np.repeat(
+            random_generator.uniform(
+                -self.maximum_relative_yaw_degrees / 2.0,
+                self.maximum_relative_yaw_degrees / 2.0,
+                (scene_count, 2),
+            ).astype(np.float32),
+            trajectories_per_scene,
+            axis=0,
+        )
+        scene_translations = np.repeat(
+            random_generator.uniform(
+                -self.maximum_scene_translation,
+                self.maximum_scene_translation,
+                (scene_count, 2),
+            ).astype(np.float32),
+            trajectories_per_scene,
+            axis=0,
+        )
         gap_center_positions = np.repeat(
             np.expand_dims(self.configured_gap_center, 0),
             n_environments,
@@ -545,11 +607,14 @@ class OpposingRampsWorldBuilder(WorldBuilder):
         gap_center_positions[:, :2] += scene_translations
 
         ramp_width = self.ramp_a_config.morph_params["size"][1]
-        clear_gap_widths = random_generator.uniform(
-            self.minimum_gap_clearance,
-            ramp_width * self.maximum_gap_width_fraction,
-            n_environments,
-        ).astype(np.float32)
+        clear_gap_widths = np.repeat(
+            random_generator.uniform(
+                self.minimum_gap_clearance,
+                ramp_width * self.maximum_gap_width_fraction,
+                scene_count,
+            ).astype(np.float32),
+            trajectories_per_scene,
+        )
         # Yaw makes each inner-edge corner protrude into the shared travel axis.
         # Add both projections so clear_gap_widths remains empty ground.
         inner_edge_center_separations = clear_gap_widths + ramp_width / 2.0 * (
@@ -607,7 +672,15 @@ class OpposingRampsWorldBuilder(WorldBuilder):
             - ramp_thickness / 2.0 * ramp_b_normals
         ).astype(np.float32)
 
-        starts_on_ramp_a = random_generator.random(n_environments) < 0.5
+        if trajectories_per_scene == 1:
+            starts_on_ramp_a = random_generator.random(n_environments) < 0.5
+        else:
+            release_index_within_scene = (
+                np.arange(n_environments) % trajectories_per_scene
+            )
+            starts_on_ramp_a = (
+                release_index_within_scene < trajectories_per_scene / 2
+            )
         selected_tangents = np.where(
             np.expand_dims(starts_on_ramp_a, -1),
             ramp_a_tangents,
@@ -675,10 +748,21 @@ class OpposingRampsWorldBuilder(WorldBuilder):
                 "No admissible inner-half ball release for environments "
                 f"{invalid_indices.tolist()}."
             )
-        release_distances = random_generator.uniform(
-            minimum_release_distances,
-            maximum_release_distances,
-        ).astype(np.float32)
+        if trajectories_per_scene == 4:
+            release_fractions = np.tile(
+                np.asarray([0.25, 0.75, 0.25, 0.75], dtype=np.float32),
+                scene_count,
+            )
+            release_distances = (
+                minimum_release_distances
+                + release_fractions
+                * (maximum_release_distances - minimum_release_distances)
+            )
+        else:
+            release_distances = random_generator.uniform(
+                minimum_release_distances,
+                maximum_release_distances,
+            ).astype(np.float32)
         ball_positions = (
             selected_inner_edge_centers
             + np.expand_dims(release_distances, -1) * selected_tangents
@@ -700,6 +784,7 @@ class OpposingRampsWorldBuilder(WorldBuilder):
         world: World,
         random_generator: np.random.Generator,
         n_environments: int,
+        trajectories_per_scene,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Apply randomized ramp poses and ball releases to a batched world."""
         (
@@ -713,6 +798,7 @@ class OpposingRampsWorldBuilder(WorldBuilder):
         ) = self._create_randomized_opposing_ramp_values(
             random_generator,
             n_environments,
+            trajectories_per_scene,
         )
         world.landscape["ramp_a"].set_pos(ramp_a_positions)
         world.landscape["ramp_a"].set_quat(
@@ -792,6 +878,7 @@ class OpposingRampsWorldBuilder(WorldBuilder):
         n_environments: int = 1,
         ghost_count: int = 0,
         random_generator: np.random.Generator | None = None,
+        trajectories_per_scene: int = 1,
     ) -> tuple[World, Optional[TrajectoryRecorder]]:
         """Scaffold and configure the opposing-ramp scene."""
         world, trajectory_recorder = self.scaffold_world(
@@ -806,6 +893,7 @@ class OpposingRampsWorldBuilder(WorldBuilder):
                     world,
                     random_generator,
                     n_environments,
+                    trajectories_per_scene,
                 )
             )
             scene_transform = self._compute_scene_transform(
