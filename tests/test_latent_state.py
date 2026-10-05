@@ -71,6 +71,12 @@ class LatentStateTest(unittest.TestCase):
         with patch("sys.argv", ["eval.py"]):
             self.assertIsNone(get_eval_args().world)
 
+    def test_training_enables_layer_norm_by_default_with_opt_out(self):
+        with patch("sys.argv", ["train.py"]):
+            self.assertTrue(get_training_args().layer_norm)
+        with patch("sys.argv", ["train.py", "--no-layer-norm"]):
+            self.assertFalse(get_training_args().layer_norm)
+
     def test_eval_resolves_explicit_checkpoint_and_legacy_worlds(self):
         self.assertEqual(
             _resolve_world_builder_name(
@@ -237,6 +243,7 @@ class LatentStateTest(unittest.TestCase):
                 "hidden_size": 8,
                 "scene_feature_size": 2,
                 "warm_up_length": 3,
+                "layer_norm_enabled": True,
                 "state_dict": latent_model.state_dict(),
             },
             torch.device("cpu"),
@@ -266,6 +273,7 @@ class LatentStateTest(unittest.TestCase):
             latent_size=4,
             observation_embedding_size=4,
             scene_feature_size=SIMPLE_ROLLING_SCENE_FEATURE_SIZE,
+            layer_norm_enabled=False,
         )
         loaded_model = _load_checkpoint_model(
             {
@@ -283,6 +291,35 @@ class LatentStateTest(unittest.TestCase):
             loaded_model.encode_observation(position, scene_features),
             model.encode_observation(position, scene_features),
         )
+        self.assertFalse(loaded_model.layer_norm_enabled)
+
+    def test_layer_norm_follows_each_hidden_linear_layer(self):
+        model = LatentStateModel(
+            latent_size=4,
+            observation_embedding_size=3,
+            hidden_size=8,
+            scene_feature_size=2,
+            layer_norm_enabled=True,
+        )
+
+        expected_hidden_layer_counts = {
+            model.observation_encoder: 2,
+            model.state_updater: 2,
+            model.dynamics_model: 3,
+            model.latent_state_decoder: 2,
+        }
+        for network, hidden_layer_count in expected_hidden_layer_counts.items():
+            modules = list(network)
+            layer_norm_indices = [
+                index
+                for index, module in enumerate(modules)
+                if isinstance(module, torch.nn.LayerNorm)
+            ]
+            self.assertEqual(len(layer_norm_indices), hidden_layer_count)
+            for index in layer_norm_indices:
+                self.assertIsInstance(modules[index - 1], torch.nn.Linear)
+                self.assertIsInstance(modules[index + 1], torch.nn.ReLU)
+            self.assertIsInstance(modules[-1], torch.nn.Linear)
 
     def test_observation_corrects_a_predicted_frame_without_advancing_again(self):
         predicted_world = PredictionWorld(
@@ -524,7 +561,7 @@ class LatentStateTest(unittest.TestCase):
     def test_zero_position_weight_excludes_position_loss_from_total(self):
         """Keep reporting forecast error when reconstruction is the sole objective."""
         dataset = TrajectorySequenceDataset(
-            [np.arange(12, dtype=np.float32).reshape(4, 3)],
+            [np.arange(18, dtype=np.float32).reshape(6, 3)],
             np.zeros((1, 2), dtype=np.float32),
         )
         model = LatentStateModel(
@@ -532,7 +569,7 @@ class LatentStateTest(unittest.TestCase):
             observation_embedding_size=3,
             hidden_size=8,
             scene_feature_size=2,
-            warm_up_length=3,
+            warm_up_length=5,
         )
 
         batch_metrics = []

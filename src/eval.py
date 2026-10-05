@@ -78,6 +78,7 @@ def _load_checkpoint_model(checkpoint, device):
                 SIMPLE_ROLLING_SCENE_FEATURE_SIZE,
             ),
             warm_up_length=checkpoint["warm_up_length"],
+            layer_norm_enabled=checkpoint.get("layer_norm_enabled", False),
         )
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device)

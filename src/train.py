@@ -15,8 +15,9 @@ from training.trajectories import (
 )
 from world_models import LatentStateModel
 
-WARMUP_LENGTH = 3  # Min 2 frames for change detection since includes the frame from which we predict; three for acceleration.
-PREDICTION_HORIZON = 3
+# Min 2 frames for change detection since includes the frame from which we predict; three for acceleration. Couple extra for init stabilization
+WARMUP_LENGTH = 5
+PREDICTION_HORIZON = 10
 
 
 def _compute_observation_states(
@@ -212,13 +213,12 @@ def _build_batch_metrics(
 ) -> dict[str, float | int]:
     """Build one persisted batch record from losses and post-backward gradients.
 
-    Loss records include each loss, latent standard deviation, total loss, and the
-    element counts used by epoch aggregation. Training records additionally include
-    the full-model gradient norm and separate norms for the observation encoder,
-    state updater, dynamics model, and latent-state decoder.
+    Loss records include each MSE loss, latent standard deviation, total loss, and
+    the element counts used by epoch aggregation. Training records additionally
+    include gradient norms for the full model and each component.
 
     @param losses: Batch loss tensors and their aggregation counts.
-    @param total_loss: Weighted scalar loss used for backpropagation.
+    @param total_loss: Weighted sum of MSE values used for backpropagation.
     @param model: Model whose component gradients may be recorded.
     @param include_gradient_norms: Whether to append post-backward gradient norms.
 
@@ -269,7 +269,7 @@ def _process_epoch_pass(
     """Run one training or validation pass over trajectory batches.
 
     Supplying an optimizer enables gradient updates; None computes validation
-    metrics only. Losses are weighted by their scored scalar counts; latent_std
+    metrics only. MSE losses are weighted by their scored scalar counts; latent_std
     is a frame-weighted mean of batch statistics, not a global standard deviation.
 
     @param model: LatentStateModel being trained or evaluated.
@@ -281,7 +281,8 @@ def _process_epoch_pass(
     @param consistency_weight: Multiplier for detached-target latent MSE.
     @param batch_metrics: Optional destination for one diagnostic record per batch.
 
-    @return: Dictionary of mean losses, latent standard deviation, and total loss.
+    @return: Dictionary of MSE losses, latent standard deviation, and weighted
+        MSE total_loss.
     """
     metric_sums = {
         "position_loss": 0.0,
@@ -584,6 +585,11 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--hidden-size", type=int, default=32)  # not dynamics model
     parser.add_argument("--latent-size", type=int, default=32)
     parser.add_argument("--observation-embedding-size", type=int, default=32)
+    parser.add_argument(
+        "--layer-norm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--position-weight", type=float, default=1.0)
     parser.add_argument("--reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--consistency-weight", type=float, default=0.1)
@@ -700,6 +706,7 @@ def main() -> None:
         hidden_size=args.hidden_size,
         scene_feature_size=world_builder.scene_feature_size,
         warm_up_length=WARMUP_LENGTH,
+        layer_norm_enabled=args.layer_norm,
     ).to(device)
     config = {
         "lr": args.learning_rate,
@@ -728,6 +735,7 @@ def main() -> None:
         "hidden_size": model.hidden_size,
         "scene_feature_size": model.scene_feature_size,
         "warm_up_length": model.warm_up_length,
+        "layer_norm_enabled": model.layer_norm_enabled,
         "prediction_horizon": PREDICTION_HORIZON,
         "state_dict": model.state_dict(),
         "training_metadata": {

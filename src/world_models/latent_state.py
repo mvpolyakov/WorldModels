@@ -4,45 +4,58 @@ from torch import nn
 from sim.scene_features import OPPOSING_RAMPS_SCENE_FEATURE_SIZE
 
 
-def _build_mlp(input_size: int, output_size: int, hidden_size: int) -> nn.Sequential:
-    """Build an MLP with two ReLU-activated hidden layers.
+def _build_mlp(
+    input_size: int,
+    output_size: int,
+    hidden_size: int,
+    *,
+    layer_norm_enabled: bool,
+) -> nn.Sequential:
+    """Build an MLP with two optionally normalized hidden layers.
 
     @param input_size: Number of input values per sample.
     @param output_size: Number of output values per sample.
     @param hidden_size: Width of both hidden layers.
+    @param layer_norm_enabled: Whether to normalize each hidden linear output.
 
     @return: Sequential linear network mapping input_size to output_size.
     """
-    return nn.Sequential(
-        nn.Linear(input_size, hidden_size),
-        nn.ReLU(),
-        nn.Linear(hidden_size, hidden_size),
-        nn.ReLU(),
-        nn.Linear(hidden_size, output_size),
-    )
+    layers = [nn.Linear(input_size, hidden_size)]
+    if layer_norm_enabled:
+        layers.append(nn.LayerNorm(hidden_size))
+    layers.extend((nn.ReLU(), nn.Linear(hidden_size, hidden_size)))
+    if layer_norm_enabled:
+        layers.append(nn.LayerNorm(hidden_size))
+    layers.extend((nn.ReLU(), nn.Linear(hidden_size, output_size)))
+    return nn.Sequential(*layers)
 
-def _build_mlp2(input_size: int, output_size: int) -> nn.Sequential:
-    """Build an MLP with two ReLU-activated hidden layers.
+
+def _build_mlp2(
+    input_size: int,
+    output_size: int,
+    *,
+    layer_norm_enabled: bool,
+) -> nn.Sequential:
+    """Build the dynamics MLP with three optionally normalized hidden layers.
 
     @param input_size: Number of input values per sample.
     @param output_size: Number of output values per sample.
-    @param hidden_size: Width of both hidden layers.
+    @param layer_norm_enabled: Whether to normalize each hidden linear output.
 
     @return: Sequential linear network mapping input_size to output_size.
     """
 
-    hidden_size = 64
-    return nn.Sequential(
-        nn.Linear(input_size, hidden_size),
-        nn.ReLU(),
-        nn.Linear(hidden_size, hidden_size),
-        nn.ReLU(),
-        nn.Linear(hidden_size, hidden_size),
-        nn.ReLU(),
-        nn.Linear(hidden_size, hidden_size),
-        nn.ReLU(),
-        nn.Linear(hidden_size, output_size),
-    )
+    hidden_size = 32
+    layers = []
+    hidden_input_size = input_size
+    for _ in range(3):
+        layers.append(nn.Linear(hidden_input_size, hidden_size))
+        if layer_norm_enabled:
+            layers.append(nn.LayerNorm(hidden_size))
+        layers.append(nn.ReLU())
+        hidden_input_size = hidden_size
+    layers.append(nn.Linear(hidden_size, output_size))
+    return nn.Sequential(*layers)
 
 
 class LatentStateModel(nn.Module):
@@ -54,9 +67,10 @@ class LatentStateModel(nn.Module):
 
     @param latent_size: L, the persistent latent width.
     @param observation_embedding_size: E, the encoded observation width.
-    @param hidden_size: Width of each MLP's two hidden layers.
+    @param hidden_size: Width of the observation, update, and decoder hidden layers.
     @param scene_feature_size: F, the static scene-context width.
     @param warm_up_length: Number of observed frames before autonomous prediction.
+    @param layer_norm_enabled: Whether hidden MLP layers use LayerNorm.
     """
 
     def __init__(
@@ -67,6 +81,7 @@ class LatentStateModel(nn.Module):
         warm_up_length: int = 5,
         *,
         observation_embedding_size: int,
+        layer_norm_enabled: bool = True,
     ):
         """Configure the observation, update, transition, and decoder MLPs."""
         super().__init__()
@@ -82,21 +97,33 @@ class LatentStateModel(nn.Module):
         self.hidden_size = hidden_size
         self.scene_feature_size = scene_feature_size
         self.warm_up_length = warm_up_length
+        self.layer_norm_enabled = layer_norm_enabled
 
         # Component models
         self.observation_encoder = _build_mlp(
             3 + scene_feature_size,                 # 3=position of a single object
             observation_embedding_size,
             hidden_size,
+            layer_norm_enabled=layer_norm_enabled,
         )
         self.state_updater = _build_mlp(
             latent_size + observation_embedding_size,
             latent_size,
             hidden_size,
+            layer_norm_enabled=layer_norm_enabled,
         )
-        self.dynamics_model = _build_mlp2(latent_size, latent_size)
-        
-        self.latent_state_decoder = _build_mlp(latent_size, 3, hidden_size)
+        self.dynamics_model = _build_mlp2(
+            latent_size,
+            latent_size,
+            layer_norm_enabled=layer_norm_enabled,
+        )
+
+        self.latent_state_decoder = _build_mlp(
+            latent_size,
+            3,
+            hidden_size,
+            layer_norm_enabled=layer_norm_enabled,
+        )
 
     def get_required_history(self) -> int:
         """Return the number of observations required before prediction."""
