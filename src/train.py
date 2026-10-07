@@ -129,11 +129,161 @@ def _compute_penetration_error_sum(
         * (~padding_frame_mask).unsqueeze(-1)
     )
 
+
+def _compute_autonomous_rollout_error_sums(
+    model: LatentStateModel,
+    observation_states: torch.Tensor,
+    observed_positions: torch.Tensor,
+    scene_features: torch.Tensor,
+    padding_frame_mask: torch.Tensor,
+    compute_penetration_loss: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Score all autonomous forecast starts in parallel at each forecast offset.
+
+    B is the number of trajectory slices in the current DataLoader batch, T is
+    the padded frame count per slice, W is WARMUP_LENGTH, L is latent width, and
+    F is scene-feature width. Each slice still starts a forecast at every frame
+    from W - 1 through T - 2. These T - W starts are stored in a second batch
+    dimension: index 0 starts at frame W - 1, index 1 starts at frame W, and so
+    on. States therefore begin with shape (B, T - W, L).
+
+    With the current defaults B is normally 4, T is 64, and W is 5. The tensor
+    therefore has 4 slice rows and 59 forecast-start columns at offset 1. It has
+    58 columns at offset 2 and continues shrinking to 50 columns at offset 10.
+    A final partial DataLoader batch can have fewer than 4 rows. A slice with
+    fewer than 64 real frames still occupies one padded row; its padding mask
+    excludes unavailable forecasts from the losses.
+
+    The loop advances every start by one forecast offset at a time. Offset 1
+    predicts the frame immediately after each start. Offset 2 advances those
+    predicted states once more. Starts are removed from the end of the second
+    dimension when the requested offset would pass frame T - 1. Each start
+    retains its own recurrent state throughout.
+
+    For a sequence ending at frame 7, starts at frames 4, 5, and 6 predict frames
+    5, 6, and 7 together at offset 1. At offset 2, start 6 is dropped because
+    frame 8 is unavailable; the carried states for starts 4 and 5 predict frames
+    6 and 7 together.
+
+    The two batch dimensions propagate as follows. Subrows within one offset are
+     the B trajectory slices in the DataLoader batch, columns are forecast starts,
+    and every cell contains L latent values. 
+    ``s[b,t]`` is the observed state for slice b at frame t;
+    ``p[b,a->t]`` is a forecast that started at frame a and has reached frame t.
+
+    ::
+
+                       forecast-start dimension R
+                       start 4       start 5       start 6
+        initial slice 0  s[0,4]        s[0,5]        s[0,6]
+                slice 1  s[1,4]        s[1,5]        s[1,6]
+                 ...      |              |              |
+                          v              v              v
+        offset 1 slice 0  p[0,4->5]     p[0,5->6]     p[0,6->7]
+                 slice 1  p[1,4->5]     p[1,5->6]     p[1,6->7]
+                 ...      |              |
+                          v              v          column dropped
+        offset 2 slice 0  p[0,4->6]     p[0,5->7]
+                 slice 1  p[1,4->6]     p[1,5->7]
+                 ...
+
+    One model call advances every cell in an offset block. Vertical arrows retain
+    recurrence within one slice and one forecast start; no state crosses a
+    row or column.
+
+    @param model: Latent model used for autonomous transitions and decoding.
+    @param observation_states: Observation-informed states shaped (B, T, L).
+    @param observed_positions: Actual XYZ positions shaped (B, T, 3).
+    @param scene_features: Static packed surface features shaped (B, F).
+    @param padding_frame_mask: Boolean tensor shaped (B, T); True excludes a frame.
+    @param compute_penetration_loss: Whether to calculate penetration errors.
+
+    @return: Position, penetration, and consistency error sums, followed by the
+        number of non-padding forecast frames scored across all starts and offsets.
+    """
+    batch_size, padded_frame_count, _ = observed_positions.shape
+    position_error_sum = observed_positions.new_zeros(())
+    penetration_error_sum = observed_positions.new_zeros(())
+    consistency_error_sum = observed_positions.new_zeros(())
+    forecast_frame_count = torch.zeros(
+        (),
+        dtype=torch.long,
+        device=observed_positions.device,
+    )
+
+    forecast_start_count = max(padded_frame_count - WARMUP_LENGTH, 0)
+    forecast_start_frames = torch.arange(
+        WARMUP_LENGTH - 1,
+        WARMUP_LENGTH - 1 + forecast_start_count,
+        device=observed_positions.device,
+    )
+    predicted_states = observation_states[:, forecast_start_frames]
+    maximum_forecast_offset = min(
+        PREDICTION_HORIZON,
+        forecast_start_count,
+    )
+
+    for forecast_offset in range(1, maximum_forecast_offset + 1):
+        # The latest start loses one available target at each new horizon.
+        active_start_count = forecast_start_count - forecast_offset + 1
+        active_start_frames = forecast_start_frames[:active_start_count]
+        target_frames = active_start_frames + forecast_offset
+
+        predicted_states = model.predict_state(
+            predicted_states[:, :active_start_count]
+        )
+        predicted_positions = model.decode_state(predicted_states)
+        target_positions = observed_positions[:, target_frames]
+        forecast_padding_mask = (
+            padding_frame_mask[:, active_start_frames]
+            | padding_frame_mask[:, target_frames]
+        )
+        scored_forecast_mask = (~forecast_padding_mask).unsqueeze(-1)
+
+        position_error_sum = position_error_sum + torch.sum(
+            (predicted_positions - target_positions) ** 2
+            * scored_forecast_mask
+        )
+        if compute_penetration_loss:
+            flat_forecast_count = batch_size * active_start_count
+            repeated_scene_features = scene_features.repeat_interleave(
+                active_start_count,
+                dim=0,
+            )
+            penetration_error_sum = (
+                penetration_error_sum
+                + _compute_penetration_error_sum(
+                    model,
+                    predicted_positions.reshape(flat_forecast_count, 3),
+                    target_positions.reshape(flat_forecast_count, 3),
+                    repeated_scene_features,
+                    forecast_padding_mask.reshape(flat_forecast_count),
+                )
+            )
+        consistency_error_sum = (
+            consistency_error_sum
+            + _compute_consistency_error_sum(
+                predicted_states,
+                observation_states[:, target_frames],
+                forecast_padding_mask,
+            )
+        )
+        forecast_frame_count = forecast_frame_count + scored_forecast_mask.sum()
+
+    return (
+        position_error_sum,
+        penetration_error_sum,
+        consistency_error_sum,
+        int(forecast_frame_count.item()),
+    )
+
+
 def _compute_batch_losses(
     model: LatentStateModel,
     observed_positions: torch.Tensor,
     scene_features: torch.Tensor,
     padding_frame_mask: torch.Tensor,
+    compute_penetration_loss: bool,
 ):
     """Compute reconstruction and autonomous forecast losses for a padded batch.
 
@@ -144,6 +294,7 @@ def _compute_batch_losses(
     @param observed_positions: XYZ observations (B, T, 3), with finite padding.
     @param scene_features: Static scene features (B, F).
     @param padding_frame_mask: Boolean tensor (B, T); True marks trailing padding.
+    @param compute_penetration_loss: Whether to calculate penetration errors.
 
     @return: Scalar tensors position_loss, penetration_loss, reconstruction_loss,
         consistency_loss, and latent_std; their integer aggregation counts and
@@ -174,56 +325,19 @@ def _compute_batch_losses(
     )
     reconstruction_element_count = observed_frame_count * position_size
 
-
-    # Autonomous rollout branch
-
-    # init to a scalar tensor that takes a gradient (useful if n=0)
-    position_error_sum = observed_positions.new_zeros(())
-    penetration_error_sum = observed_positions.new_zeros(())
-    consistency_error_sum = observed_positions.new_zeros(())
-
-    forecast_frame_count = 0
-
-    # A forecast starts at the last observed frame of its warm-up. Its state
-    # remains connected to that history, but receives no subsequent observations.
-    for forecast_start_frame in range(WARMUP_LENGTH - 1, padded_frame_count - 1):
-        predicted_state = observation_states[:, forecast_start_frame]
-        forecast_stop_frame = min(
-            padded_frame_count,
-            forecast_start_frame + PREDICTION_HORIZON + 1,
-        )
-        for target_frame in range(forecast_start_frame + 1, forecast_stop_frame):
-            predicted_state = model.predict_state(predicted_state)
-            predicted_position = model.decode_state(predicted_state)
-            forecast_padding_mask = (
-                padding_frame_mask[:, forecast_start_frame]
-                | padding_frame_mask[:, target_frame]
-            )
-            position_error_sum = position_error_sum + torch.sum(
-                (predicted_position - observed_positions[:, target_frame]) ** 2
-                * (~forecast_padding_mask).unsqueeze(-1)
-            )
-            penetration_error_sum = (
-                penetration_error_sum
-                + _compute_penetration_error_sum(
-                    model,
-                    predicted_position,
-                    observed_positions[:, target_frame],
-                    scene_features,
-                    forecast_padding_mask,
-                )
-            )
-            # avoid += because that would modify value in place -- for autograd that
-            # can be an issue if the earlier value is needed later (not here)
-            consistency_error_sum = (
-                consistency_error_sum
-                + _compute_consistency_error_sum(
-                    predicted_state,
-                    observation_states[:, target_frame],
-                    forecast_padding_mask,
-                )
-            )
-            forecast_frame_count += int((~forecast_padding_mask).sum().item())
+    (
+        position_error_sum,
+        penetration_error_sum,
+        consistency_error_sum,
+        forecast_frame_count,
+    ) = _compute_autonomous_rollout_error_sums(
+        model,
+        observation_states,
+        observed_positions,
+        scene_features,
+        padding_frame_mask,
+        compute_penetration_loss,
+    )
 
     # Average over scored scalar values, not padded frames or trajectory count.
     # A frame can be scored by several forecasts starting at different times.
@@ -375,6 +489,7 @@ def _process_epoch_pass(
             observed_positions,
             scene_features,
             padding_frame_mask, # which frame for each trajectory are real and which are just padding at end
+            compute_penetration_loss=penetration_weight > 0,
         )
         total_loss = (
             position_weight * losses["position_loss"]
@@ -653,8 +768,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--slices-per-trajectory", type=int, default=4)
     parser.add_argument("--max-slice-length", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--hidden-size", type=int, default=32)  # not dynamics model
-    parser.add_argument("--latent-size", type=int, default=32) # width of latent state
+    parser.add_argument("--hidden-size", type=int, default=16)  # not dynamics model
+    parser.add_argument("--latent-size", type=int, default=8) # width of latent state
     parser.add_argument(
         "--layer-norm",
         action=argparse.BooleanOptionalAction,
@@ -709,6 +824,12 @@ def main() -> None:
 
     import genesis as gs
 
+    if args.backend == "gpu" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "GPU backend was requested, but PyTorch cannot access CUDA. "
+            "Refusing to fall back to CPU."
+        )
+
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested, but no CUDA device is available.")
@@ -721,6 +842,11 @@ def main() -> None:
         gs.init(backend=genesis_backend, seed=args.seed)
     else:
         gs.init(backend=genesis_backend)
+    if args.backend == "gpu" and gs.backend == gs.cpu:
+        raise RuntimeError(
+            "GPU backend was requested, but Genesis initialized its CPU backend. "
+            "Refusing to continue with CPU simulation."
+        )
 
     random_generator = np.random.default_rng(None if args.seed == 0 else args.seed)
     sampling_seeds = random_generator.integers(

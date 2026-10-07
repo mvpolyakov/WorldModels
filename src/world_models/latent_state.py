@@ -49,7 +49,7 @@ def _build_mlp2(
     @return: Sequential linear network mapping input_size to output_size.
     """
 
-    hidden_size = 32
+    hidden_size = 16
     layers = []
     hidden_input_size = input_size
     for _ in range(3):
@@ -242,18 +242,24 @@ class LatentStateModel(nn.Module):
     def predict_state(self, state: torch.Tensor) -> torch.Tensor:
         """Predict the next frame's latent with a learned residual update.
 
-        @param state: Current latent with shape (B, L).
+        B is trajectory batch size, R is forecast-start count, and L is latent
+        width. The optional R dimension batches independent rollout starts.
 
-        @return: Predicted next-frame latent with shape (B, L).
+        @param state: Current latent with shape (B, L) or (B, R, L).
+
+        @return: Predicted latent with the same shape as state.
         """
         return state + self.dynamics_model(state)
 
     def decode_state(self, state: torch.Tensor) -> torch.Tensor:
         """Decode absolute XYZ positions from latent states.
 
-        @param state: Latent tensor with shape (B, L).
+        B is trajectory batch size, R is forecast-start count, and L is latent
+        width.
 
-        @return: Absolute XYZ positions with shape (B, 3).
+        @param state: Latent tensor with shape (B, L) or (B, R, L).
+
+        @return: Absolute XYZ positions with shape (B, 3) or (B, R, 3).
         """
         return self.latent_state_decoder(state)
 

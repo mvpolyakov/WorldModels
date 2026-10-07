@@ -433,10 +433,46 @@ class LatentStateTest(unittest.TestCase):
             positions,
             torch.from_numpy(_surface_features(1)),
             torch.zeros((1, 5), dtype=torch.bool),
+            compute_penetration_loss=False,
         )
 
         self.assertEqual(losses["reconstruction_loss"].item(), 0.0)
         self.assertEqual(losses["position_loss"].item(), 0.0)
+
+    def test_autonomous_rollout_batches_forecast_starts_by_horizon(self):
+        model = LatentStateModel(
+            latent_size=4,
+            hidden_size=8,
+            warm_up_length=5,
+        )
+        autonomous_state_shapes = []
+        original_predict_state = model.predict_state
+
+        def record_predict_state_shape(state):
+            if state.ndim == 3:
+                autonomous_state_shapes.append(tuple(state.shape))
+            return original_predict_state(state)
+
+        with patch.object(
+            model,
+            "predict_state",
+            side_effect=record_predict_state_shape,
+        ):
+            _compute_batch_losses(
+                model,
+                torch.randn((2, 16, 3)),
+                torch.from_numpy(_surface_features(2)),
+                torch.zeros((2, 16), dtype=torch.bool),
+                compute_penetration_loss=False,
+            )
+
+        self.assertEqual(
+            autonomous_state_shapes,
+            [
+                (2, active_start_count, 4)
+                for active_start_count in range(11, 1, -1)
+            ],
+        )
 
     def test_padding_is_excluded_from_updates_and_losses(self):
         dataset = TrajectorySequenceDataset(
@@ -465,6 +501,7 @@ class LatentStateTest(unittest.TestCase):
             positions,
             features,
             padding_frame_mask,
+            compute_penetration_loss=False,
         )
         changed_padding = positions.clone()
         changed_padding[padding_frame_mask] = 1e6
@@ -473,6 +510,7 @@ class LatentStateTest(unittest.TestCase):
             changed_padding,
             features,
             padding_frame_mask,
+            compute_penetration_loss=False,
         )
 
         torch.testing.assert_close(lengths, torch.tensor([6, 8]))
@@ -511,6 +549,7 @@ class LatentStateTest(unittest.TestCase):
             torch.ones((1, 1, 3)),
             torch.from_numpy(_surface_features(1)),
             torch.zeros((1, 1), dtype=torch.bool),
+            compute_penetration_loss=False,
         )
         self.assertEqual(losses["observed_frame_count"], 1)
         self.assertEqual(losses["reconstruction_element_count"], 3)
@@ -552,6 +591,7 @@ class LatentStateTest(unittest.TestCase):
             positions,
             features,
             padding_frame_mask,
+            compute_penetration_loss=False,
         )
         losses["reconstruction_loss"].backward()
 
