@@ -63,34 +63,17 @@ def _build_mlp2(
 
 
 class ObservationEncoder(nn.Module):
-    """Convert raw observations into embeddings for latent-state updates.
+    """Distill raw coordinate observations for latent-state updates.
 
     The coordinate input path prepares position, closest-surface gap and normal,
-    and radius before applying the learned network. B is batch size, S is surface
-    count, and E is embedding width.
+    and radius. These values pass directly to the state updater; learned visual
+    encoding can replace this simplified path when observations become images.
+    B is batch size and S is surface count.
     """
 
-    # A function of its encoding process = 3 (closest surface normal) +
-    #                                      1 (gap) +
-    #                                      1 (ball radius) +
-    #                                      3 (ball position) 
-    scene_feature_size = 8 
-
-    def __init__(
-        self,
-        observation_embedding_size: int,
-        hidden_size: int,
-        *,
-        layer_norm_enabled: bool,
-    ):
-        """Size the network from the caller's prepared feature-vector width."""
-        super().__init__()
-        self.network = _build_mlp(
-            self.scene_feature_size,
-            observation_embedding_size,
-            hidden_size,
-            layer_norm_enabled=layer_norm_enabled,
-        )
+    # XYZ position + gap + normal XYZ + radius. These distilled values currently
+    # pass directly to the state updater without a learned encoding.
+    scene_feature_size = 8
 
     def compute_closest_surface_context(
         self,
@@ -134,28 +117,27 @@ class ObservationEncoder(nn.Module):
         position: torch.Tensor,
         scene_features: torch.Tensor,
     ) -> torch.Tensor:
-        """Encode raw coordinates and scene geometry into an observation embedding.
+        """Prepare distilled coordinate and surface features for a state update.
 
         @param position: Observed ball-center XYZ positions, shape (B, 3).
         @param scene_features: Packed plane records and radius, shape (B, 6*S + 1).
 
-        @return: Learned observation embedding, shape (B, E).
+        @return: Position, gap, normal, and radius, shape (B, 8).
         """
         surface_context = self.compute_closest_surface_context(position, scene_features)
         ball_radii = scene_features[:, -1:]
-        return self.network(torch.cat([position, surface_context, ball_radii], dim=1))
+        return torch.cat([position, surface_context, ball_radii], dim=1)
 
 
 class LatentStateModel(nn.Module):
     """Encode observations and predict a caller-owned latent state through time.
 
-    B is batch size, L is latent size, E is observation embedding size, and F
-    is packed surface-feature size (6*S + 1 for S surfaces). The model
-    operates on one object per row; it never stores a row's current state.
+    B is batch size, L is latent size, and F is packed surface-feature size
+    (6*S + 1 for S surfaces). The model operates on one object per row; it never
+    stores a row's current state.
 
     @param latent_size: L, the persistent latent width.
-    @param observation_embedding_size: E, the encoded observation width.
-    @param hidden_size: Width of the observation, update, and decoder hidden layers.
+    @param hidden_size: Width of the state-update and decoder hidden layers.
     @param warm_up_length: Number of observed frames before autonomous prediction.
     @param layer_norm_enabled: Whether hidden MLP layers use LayerNorm.
     """
@@ -166,32 +148,24 @@ class LatentStateModel(nn.Module):
         hidden_size: int = 64,
         warm_up_length: int = 5,
         *,
-        observation_embedding_size: int,
         layer_norm_enabled: bool = True,
     ):
-        """Configure the observation, update, transition, and decoder MLPs."""
+        """Configure observation preparation, update, transition, and decoding."""
         super().__init__()
         if latent_size < 1 or hidden_size < 1:
             raise ValueError("latent_size and hidden_size must be positive.")
-        if observation_embedding_size < 1:
-            raise ValueError("observation_embedding_size must be positive.")
         if warm_up_length < 1:
             raise ValueError("warm_up_length must be positive.")
 
         self.latent_size = latent_size
-        self.observation_embedding_size = observation_embedding_size
         self.hidden_size = hidden_size
         self.warm_up_length = warm_up_length
         self.layer_norm_enabled = layer_norm_enabled
 
         # Component models
-        self.observation_encoder = ObservationEncoder(
-            observation_embedding_size,
-            hidden_size,
-            layer_norm_enabled=layer_norm_enabled,
-        )
+        self.observation_encoder = ObservationEncoder()
         self.state_updater = _build_mlp(
-            latent_size + observation_embedding_size,
+            latent_size + self.observation_encoder.scene_feature_size,
             latent_size,
             hidden_size,
             layer_norm_enabled=layer_norm_enabled,

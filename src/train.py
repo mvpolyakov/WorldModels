@@ -85,6 +85,50 @@ def _compute_consistency_error_sum(
         * (~padding_frame_mask).unsqueeze(-1)
     )
 
+
+def _compute_penetration_error_sum(
+    model: LatentStateModel,
+    predicted_positions: torch.Tensor,
+    target_positions: torch.Tensor,
+    scene_features: torch.Tensor,
+    padding_frame_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Penalize predictions below the target frame's selected surface.
+
+    The target position selects the surface, so a prediction cannot avoid the
+    penalty by becoming closer to another plane. Negative target gaps establish
+    the contact solver's allowed penetration for that frame.
+
+    @param model: Model whose observation encoder owns surface selection.
+    @param predicted_positions: Predicted XYZ positions shaped (B, 3).
+    @param target_positions: Actual target XYZ positions shaped (B, 3).
+    @param scene_features: Packed surface records shaped (B, 6*S + 1).
+    @param padding_frame_mask: Boolean tensor shaped (B,); True excludes a row.
+
+    @return: Scalar sum of squared excess penetration over non-padding rows.
+    """
+    target_surface_context = model.observation_encoder.compute_closest_surface_context(
+        target_positions,
+        scene_features,
+    )
+    # Target is used here because that's what's coming back from above line, just a computational trick
+    target_surface_gap = target_surface_context[:, :1]
+    selected_surface_normal = target_surface_context[:, 1:]
+    predicted_surface_gap = target_surface_gap + torch.sum(
+        (predicted_positions - target_positions) * selected_surface_normal,
+        dim=1,
+        keepdim=True,
+    )
+    minimum_allowed_gap = torch.minimum(
+        target_surface_gap,
+        torch.zeros_like(target_surface_gap),
+    )
+    excess_penetration = torch.relu(minimum_allowed_gap - predicted_surface_gap)
+    return torch.sum(
+        excess_penetration.square()
+        * (~padding_frame_mask).unsqueeze(-1)
+    )
+
 def _compute_batch_losses(
     model: LatentStateModel,
     observed_positions: torch.Tensor,
@@ -101,10 +145,10 @@ def _compute_batch_losses(
     @param scene_features: Static scene features (B, F).
     @param padding_frame_mask: Boolean tensor (B, T); True marks trailing padding.
 
-    @return: Scalar tensors position_loss, reconstruction_loss, consistency_loss,
-        and latent_std; integer position_element_count, reconstruction_element_count,
-        consistency_element_count, and observed_frame_count for epoch aggregation.
-        Forecast losses are zero when no frames remain after warm-up.
+    @return: Scalar tensors position_loss, penetration_loss, reconstruction_loss,
+        consistency_loss, and latent_std; their integer aggregation counts and
+        observed_frame_count. Forecast losses are zero when no frames remain
+        after warm-up.
     """
     batch_size, padded_frame_count, position_size = observed_positions.shape
 
@@ -135,6 +179,7 @@ def _compute_batch_losses(
 
     # init to a scalar tensor that takes a gradient (useful if n=0)
     position_error_sum = observed_positions.new_zeros(())
+    penetration_error_sum = observed_positions.new_zeros(())
     consistency_error_sum = observed_positions.new_zeros(())
 
     forecast_frame_count = 0
@@ -158,6 +203,16 @@ def _compute_batch_losses(
                 (predicted_position - observed_positions[:, target_frame]) ** 2
                 * (~forecast_padding_mask).unsqueeze(-1)
             )
+            penetration_error_sum = (
+                penetration_error_sum
+                + _compute_penetration_error_sum(
+                    model,
+                    predicted_position,
+                    observed_positions[:, target_frame],
+                    scene_features,
+                    forecast_padding_mask,
+                )
+            )
             # avoid += because that would modify value in place -- for autograd that
             # can be an issue if the earlier value is needed later (not here)
             consistency_error_sum = (
@@ -173,14 +228,20 @@ def _compute_batch_losses(
     # Average over scored scalar values, not padded frames or trajectory count.
     # A frame can be scored by several forecasts starting at different times.
     position_element_count = forecast_frame_count * position_size
+    penetration_element_count = forecast_frame_count
     consistency_element_count = forecast_frame_count * model.latent_size
     observed_states = observation_states[~padding_frame_mask]
     return {
         "position_loss": position_error_sum / max(position_element_count, 1),
+        "penetration_loss": penetration_error_sum / max(
+            penetration_element_count,
+            1,
+        ),
         "reconstruction_loss": reconstruction_error_sum / max(reconstruction_element_count, 1),
         "consistency_loss": consistency_error_sum / max(consistency_element_count, 1),
         "latent_std": observed_states.std(dim=0, unbiased=False).mean(),
         "position_element_count": position_element_count,
+        "penetration_element_count": penetration_element_count,
         "reconstruction_element_count": reconstruction_element_count,
         "consistency_element_count": consistency_element_count,
         "observed_frame_count": observed_frame_count,
@@ -227,11 +288,13 @@ def _build_batch_metrics(
     """
     batch_metrics = {
         "position_loss": losses["position_loss"].item(),
+        "penetration_loss": losses["penetration_loss"].item(),
         "reconstruction_loss": losses["reconstruction_loss"].item(),
         "consistency_loss": losses["consistency_loss"].item(),
         "latent_std": losses["latent_std"].item(),
         "total_loss": total_loss.item(),
         "position_element_count": losses["position_element_count"],
+        "penetration_element_count": losses["penetration_element_count"],
         "reconstruction_element_count": losses["reconstruction_element_count"],
         "consistency_element_count": losses["consistency_element_count"],
         "observed_frame_count": losses["observed_frame_count"],
@@ -240,9 +303,6 @@ def _build_batch_metrics(
         batch_metrics.update(
             {
                 "gradient_norm": _compute_gradient_norm(model.parameters()),
-                "observation_encoder_gradient_norm": _compute_gradient_norm(
-                    model.observation_encoder.parameters()
-                ),
                 "state_updater_gradient_norm": _compute_gradient_norm(
                     model.state_updater.parameters()
                 ),
@@ -266,6 +326,8 @@ def _process_epoch_pass(
     reconstruction_weight: float,
     consistency_weight: float,
     batch_metrics: list[dict[str, float | int]] | None = None,
+    *,
+    penetration_weight: float = 1.0,
 ) -> dict[str, float]:
     """Run one training or validation pass over trajectory batches.
 
@@ -278,6 +340,7 @@ def _process_epoch_pass(
     @param device: Torch device receiving each batch.
     @param optimizer: Optimizer for training, or None for validation.
     @param position_weight: Multiplier for autonomous position-prediction MSE.
+    @param penetration_weight: Multiplier for excess predicted penetration MSE.
     @param reconstruction_weight: Multiplier for observation reconstruction MSE.
     @param consistency_weight: Multiplier for detached-target latent MSE.
     @param batch_metrics: Optional destination for one diagnostic record per batch.
@@ -287,12 +350,14 @@ def _process_epoch_pass(
     """
     metric_sums = {
         "position_loss": 0.0,
+        "penetration_loss": 0.0,
         "reconstruction_loss": 0.0,
         "consistency_loss": 0.0,
         "latent_std": 0.0,
     }
     metric_counts = {
         "position_loss": 0,
+        "penetration_loss": 0,
         "reconstruction_loss": 0,
         "consistency_loss": 0,
         "latent_std": 0,
@@ -313,6 +378,7 @@ def _process_epoch_pass(
         )
         total_loss = (
             position_weight * losses["position_loss"]
+            + penetration_weight * losses["penetration_loss"]
             + reconstruction_weight * losses["reconstruction_loss"]
             + consistency_weight * losses["consistency_loss"]
         )
@@ -335,6 +401,7 @@ def _process_epoch_pass(
 
         counts = {
             "position_loss": losses["position_element_count"],
+            "penetration_loss": losses["penetration_element_count"],
             "reconstruction_loss": losses["reconstruction_element_count"],
             "consistency_loss": losses["consistency_element_count"],
             "latent_std": losses["observed_frame_count"],
@@ -349,6 +416,7 @@ def _process_epoch_pass(
     }
     metrics["total_loss"] = (
         position_weight * metrics["position_loss"]
+        + penetration_weight * metrics["penetration_loss"]
         + reconstruction_weight * metrics["reconstruction_loss"]
         + consistency_weight * metrics["consistency_loss"]
     )
@@ -532,6 +600,7 @@ def train_model(
                 config["reconstruction_weight"],
                 config["consistency_weight"],
                 epoch_training_batch_metrics,
+                penetration_weight=config.get("penetration_weight", 1.0),
             )
         )
         training_batch_metrics.append(epoch_training_batch_metrics)
@@ -549,6 +618,7 @@ def train_model(
                     config["reconstruction_weight"],
                     config["consistency_weight"],
                     epoch_validation_batch_metrics,
+                    penetration_weight=config.get("penetration_weight", 1.0),
                 )
             )
             validation_batch_metrics.append(epoch_validation_batch_metrics)
@@ -584,14 +654,14 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--max-slice-length", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--hidden-size", type=int, default=32)  # not dynamics model
-    parser.add_argument("--latent-size", type=int, default=32)
-    parser.add_argument("--observation-embedding-size", type=int, default=32)
+    parser.add_argument("--latent-size", type=int, default=32) # width of latent state
     parser.add_argument(
         "--layer-norm",
         action=argparse.BooleanOptionalAction,
         default=False,
     )
     parser.add_argument("--position-weight", type=float, default=1.0)
+    parser.add_argument("--penetration-weight", type=float, default=1.0)
     parser.add_argument("--reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--consistency-weight", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
@@ -703,7 +773,6 @@ def main() -> None:
     )
     model = LatentStateModel(
         latent_size=args.latent_size,
-        observation_embedding_size=args.observation_embedding_size,
         hidden_size=args.hidden_size,
         warm_up_length=WARMUP_LENGTH,
         layer_norm_enabled=args.layer_norm,
@@ -712,6 +781,7 @@ def main() -> None:
         "lr": args.learning_rate,
         "epochs": args.epochs,
         "position_weight": args.position_weight,
+        "penetration_weight": args.penetration_weight,
         "reconstruction_weight": args.reconstruction_weight,
         "consistency_weight": args.consistency_weight,
     }
@@ -731,7 +801,6 @@ def main() -> None:
         "model_type": "LatentStateModel",
         "world_builder": args.world_builder,
         "latent_size": model.latent_size,
-        "observation_embedding_size": model.observation_embedding_size,
         "hidden_size": model.hidden_size,
         "scene_feature_size": model.observation_encoder.scene_feature_size,
         "scene_feature_schema": SURFACE_FEATURE_SCHEMA,
@@ -742,6 +811,7 @@ def main() -> None:
         "training_metadata": {
             "prediction_horizon": PREDICTION_HORIZON,
             "position_weight": args.position_weight,
+            "penetration_weight": args.penetration_weight,
             "reconstruction_weight": args.reconstruction_weight,
             "consistency_weight": args.consistency_weight,
             "trajectory_batch_size": args.trajectory_batch_size,

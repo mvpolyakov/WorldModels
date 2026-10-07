@@ -44,9 +44,7 @@ class FrameCountingLatentModel(LatentStateModel):
     def __init__(self):
         super().__init__(
             latent_size=1,
-            observation_embedding_size=1,
             hidden_size=2,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
             warm_up_length=2,
         )
 
@@ -80,13 +78,13 @@ class LatentStateTest(unittest.TestCase):
                 "opposing-ramps",
             )
         with patch("sys.argv", ["eval.py"]):
-            self.assertIsNone(get_eval_args().world)
+            self.assertEqual(get_eval_args().world, "opposing-ramps")
 
-    def test_training_enables_layer_norm_by_default_with_opt_out(self):
+    def test_training_disables_layer_norm_by_default_with_opt_in(self):
         with patch("sys.argv", ["train.py"]):
-            self.assertTrue(get_training_args().layer_norm)
-        with patch("sys.argv", ["train.py", "--no-layer-norm"]):
             self.assertFalse(get_training_args().layer_norm)
+        with patch("sys.argv", ["train.py", "--layer-norm"]):
+            self.assertTrue(get_training_args().layer_norm)
 
     def test_eval_resolves_explicit_checkpoint_and_legacy_worlds(self):
         self.assertEqual(
@@ -110,18 +108,16 @@ class LatentStateTest(unittest.TestCase):
             "opposing-ramps",
         )
 
-    def test_eval_rejects_incompatible_scene_feature_width(self):
-        model = LatentStateModel(
-            latent_size=4,
-            observation_embedding_size=3,
-            scene_feature_size=2,
-        )
-
+    def test_eval_allows_variable_surface_counts_for_latent_model(self):
+        model = LatentStateModel(latent_size=4)
         _validate_scene_feature_size(
             model,
-            np.zeros((1, 2), dtype=np.float32),
-            "compatible-world",
+            np.zeros((1, OPPOSING_RAMPS_SCENE_FEATURE_SIZE), dtype=np.float32),
+            "opposing-ramps",
         )
+
+    def test_eval_rejects_incompatible_history_mlp_scene_feature_width(self):
+        model = PositionHistoryMLP(scene_feature_size=2)
         with self.assertRaisesRegex(
             ValueError,
             "produces 19 scene features, but this model expects 2",
@@ -241,18 +237,14 @@ class LatentStateTest(unittest.TestCase):
     def test_checkpoint_dispatch_keeps_model_types_distinct(self):
         latent_model = LatentStateModel(
             latent_size=4,
-            observation_embedding_size=3,
             hidden_size=8,
-            scene_feature_size=2,
             warm_up_length=3,
         )
         loaded_latent_model = _load_checkpoint_model(
             {
                 "model_type": "LatentStateModel",
                 "latent_size": 4,
-                "observation_embedding_size": 3,
                 "hidden_size": 8,
-                "scene_feature_size": 2,
                 "warm_up_length": 3,
                 "layer_norm_enabled": True,
                 "state_dict": latent_model.state_dict(),
@@ -278,12 +270,10 @@ class LatentStateTest(unittest.TestCase):
         self.assertIsInstance(loaded_latent_model, LatentStateModel)
         self.assertIsInstance(loaded_baseline_model, PositionHistoryMLP)
 
-    def test_legacy_checkpoint_uses_latent_width_for_observation_embedding(self):
-        """Load checkpoints created before observation width was configurable."""
+    def test_checkpoint_loads_passthrough_observation_encoder(self):
+        """Restore a latent model whose observation encoder has no parameters."""
         model = LatentStateModel(
             latent_size=4,
-            observation_embedding_size=4,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
             layer_norm_enabled=False,
         )
         loaded_model = _load_checkpoint_model(
@@ -308,14 +298,11 @@ class LatentStateTest(unittest.TestCase):
     def test_layer_norm_follows_each_hidden_linear_layer(self):
         model = LatentStateModel(
             latent_size=4,
-            observation_embedding_size=3,
             hidden_size=8,
-            scene_feature_size=2,
             layer_norm_enabled=True,
         )
 
         expected_hidden_layer_counts = {
-            model.observation_encoder.network: 2,
             model.state_updater: 2,
             model.dynamics_model: 3,
             model.latent_state_decoder: 2,
@@ -352,9 +339,7 @@ class LatentStateTest(unittest.TestCase):
     def test_prediction_branches_do_not_mutate_the_starting_state(self):
         model = LatentStateModel(
             latent_size=4,
-            observation_embedding_size=3,
             hidden_size=8,
-            scene_feature_size=2,
         )
         starting_state = torch.randn((2, 4))
         saved_starting_state = starting_state.clone()
@@ -369,9 +354,7 @@ class LatentStateTest(unittest.TestCase):
     def test_autonomous_rollout_does_not_call_the_observation_encoder(self):
         model = LatentStateModel(
             latent_size=4,
-            observation_embedding_size=3,
             hidden_size=8,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
         )
 
         with patch.object(model.observation_encoder, "forward") as encode:
@@ -386,9 +369,7 @@ class LatentStateTest(unittest.TestCase):
     def test_latent_decoder_returns_absolute_position(self):
         model = LatentStateModel(
             latent_size=2,
-            observation_embedding_size=2,
             hidden_size=4,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
         )
         with torch.no_grad():
             for parameter in model.latent_state_decoder.parameters():
@@ -407,9 +388,7 @@ class LatentStateTest(unittest.TestCase):
     def test_latent_rollout_uses_decoded_absolute_positions(self):
         model = LatentStateModel(
             latent_size=2,
-            observation_embedding_size=2,
             hidden_size=4,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
             warm_up_length=3,
         )
         with torch.no_grad():
@@ -440,9 +419,7 @@ class LatentStateTest(unittest.TestCase):
     def test_constant_position_decoder_reconstructs_and_forecasts_static_motion(self):
         model = LatentStateModel(
             latent_size=2,
-            observation_embedding_size=2,
             hidden_size=4,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
             warm_up_length=3,
         )
         with torch.no_grad():
@@ -479,9 +456,7 @@ class LatentStateTest(unittest.TestCase):
         )
         model = LatentStateModel(
             latent_size=4,
-            observation_embedding_size=3,
             hidden_size=8,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
             warm_up_length=3,
         )
 
@@ -530,8 +505,6 @@ class LatentStateTest(unittest.TestCase):
         """A single observation cannot seed a forecast after the warm-up."""
         model = LatentStateModel(
             latent_size=4,
-            observation_embedding_size=3,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
         )
         losses = _compute_batch_losses(
             model,
@@ -564,12 +537,10 @@ class LatentStateTest(unittest.TestCase):
         )
         self.assertIsNone(targets.grad)
 
-    def test_reconstruction_loss_trains_encoder_and_updater(self):
+    def test_reconstruction_loss_trains_state_updater(self):
         model = LatentStateModel(
             latent_size=4,
-            observation_embedding_size=3,
             hidden_size=8,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
             warm_up_length=2,
         )
         positions = torch.randn((2, 4, 3))
@@ -584,9 +555,7 @@ class LatentStateTest(unittest.TestCase):
         )
         losses["reconstruction_loss"].backward()
 
-        self.assertTrue(
-            any(parameter.grad is not None for parameter in model.observation_encoder.parameters())
-        )
+        self.assertEqual(list(model.observation_encoder.parameters()), [])
         self.assertTrue(
             any(parameter.grad is not None for parameter in model.state_updater.parameters())
         )
@@ -599,9 +568,7 @@ class LatentStateTest(unittest.TestCase):
         )
         model = LatentStateModel(
             latent_size=4,
-            observation_embedding_size=3,
             hidden_size=8,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
             warm_up_length=5,
         )
 
@@ -615,6 +582,7 @@ class LatentStateTest(unittest.TestCase):
             1.0,
             0.0,
             batch_metrics,
+            penetration_weight=0.0,
         )
 
         self.assertGreater(metrics["position_loss"], 0.0)
@@ -630,9 +598,7 @@ class LatentStateTest(unittest.TestCase):
         )
         model = LatentStateModel(
             latent_size=4,
-            observation_embedding_size=3,
             hidden_size=8,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
             warm_up_length=3,
         )
         batch_metrics = []
@@ -651,7 +617,6 @@ class LatentStateTest(unittest.TestCase):
         self.assertEqual(len(batch_metrics), 1)
         for name in (
             "gradient_norm",
-            "observation_encoder_gradient_norm",
             "state_updater_gradient_norm",
             "dynamics_model_gradient_norm",
             "latent_state_decoder_gradient_norm",
@@ -671,9 +636,7 @@ class LatentStateTest(unittest.TestCase):
         torch.manual_seed(4)
         model = LatentStateModel(
             latent_size=4,
-            observation_embedding_size=3,
             hidden_size=8,
-            scene_feature_size=SURFACE_ENCODER_FEATURE_SIZE,
             warm_up_length=3,
         )
         observed_positions = np.arange(9, dtype=np.float32).reshape(3, 3) / 10.0

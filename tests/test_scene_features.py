@@ -9,7 +9,7 @@ from sim.scene_features import (
     pack_surface_features,
     unpack_surface_features,
 )
-from world_models.latent_state import ObservationEncoder
+from world_models.latent_state import LatentStateModel, ObservationEncoder
 
 
 class SurfaceFeaturesTest(unittest.TestCase):
@@ -143,13 +143,7 @@ class SurfaceFeaturesTest(unittest.TestCase):
         )
 
     def test_encoder_assembles_position_selected_context_and_radius(self):
-        encoder = ObservationEncoder(
-            scene_feature_size=8,
-            observation_embedding_size=8,
-            hidden_size=4,
-            layer_norm_enabled=False,
-        )
-        encoder.network = torch.nn.Identity()
+        encoder = ObservationEncoder()
         position = torch.tensor([[1.0, 2.0, 0.25]])
         surface_features = torch.tensor(
             [[
@@ -166,14 +160,14 @@ class SurfaceFeaturesTest(unittest.TestCase):
             torch.tensor([[1.0, 2.0, 0.25, 0.05, 0.0, 0.0, 1.0, 0.2]]),
         )
 
+    def test_latent_state_updater_uses_passthrough_encoder_width(self):
+        model = LatentStateModel(latent_size=5, hidden_size=4)
+
+        self.assertEqual(ObservationEncoder.scene_feature_size, 8)
+        self.assertEqual(model.state_updater[0].in_features, 5 + 8)
+
     def test_unselected_farther_surface_does_not_change_encoder_input(self):
-        encoder = ObservationEncoder(
-            scene_feature_size=8,
-            observation_embedding_size=8,
-            hidden_size=4,
-            layer_norm_enabled=False,
-        )
-        encoder.network = torch.nn.Identity()
+        encoder = ObservationEncoder()
         position = torch.tensor([[0.0, 0.0, 0.3]])
         nearest_surface = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
         radius = [0.2]

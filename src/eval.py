@@ -37,7 +37,7 @@ def _resolve_world_builder_name(
 
 def _validate_scene_feature_size(model, world_scene_features, world_builder_name: str) -> None:
     """Reject a world whose scene features cannot be consumed by the model."""
-    if not isinstance(model, (LatentStateModel, PositionHistoryMLP)):
+    if not isinstance(model, PositionHistoryMLP):
         return
     actual_feature_size = world_scene_features.shape[1]
     if actual_feature_size != model.scene_feature_size:
@@ -69,14 +69,7 @@ def _load_checkpoint_model(checkpoint, device):
     elif checkpoint.get("model_type") == "LatentStateModel":
         model = LatentStateModel(
             latent_size=checkpoint["latent_size"],
-            observation_embedding_size=checkpoint.get(
-                "observation_embedding_size", checkpoint["latent_size"]
-            ),
             hidden_size=checkpoint["hidden_size"],
-            scene_feature_size=checkpoint.get(
-                "scene_feature_size",
-                SIMPLE_ROLLING_SCENE_FEATURE_SIZE,
-            ),
             warm_up_length=checkpoint["warm_up_length"],
             layer_norm_enabled=checkpoint.get("layer_norm_enabled", False),
         )
