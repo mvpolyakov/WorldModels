@@ -14,7 +14,7 @@ def pack_surface_features(
     box_thicknesses: np.ndarray,
     ball_radii: np.ndarray,
 ) -> np.ndarray:
-    """Build flat top-plane records from batched box poses.
+    """Compute and pack flat top-plane records from batched box poses.
 
     B is environment count and S is surface count. Each box rotation maps its
     local axes into world coordinates; its local Z axis is the outward top-face
@@ -33,10 +33,21 @@ def pack_surface_features(
     @return: Float array shaped (B, 6*S + 1), containing consecutive
         [top_center_xyz, normal_xyz] records followed by ball radius.
     """
-    raise NotImplementedError
+    surface_normals = rotation_matrices[:, :, :, 2]
+    surface_centers = box_centers + (
+        surface_normals * box_thicknesses.reshape(1, -1, 1) / 2.0
+    )
+    surface_records = np.concatenate(
+        (surface_centers, surface_normals),
+        axis=2,
+    )
+    return np.concatenate(
+        (surface_records.reshape(box_centers.shape[0], -1), ball_radii),
+        axis=1,
+    ).astype(np.float32)
 
-# These need to be packed and unpacked because they are part of the training 
-# data / data loader -- easier to keep those as tensors
+
+# Packing keeps each scene's static geometry in one tensor for the data loader.
 def unpack_surface_features(
     surface_features: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -48,7 +59,16 @@ def unpack_surface_features(
     @return: Surface centers shaped (B, S, 3), outward unit normals shaped
         (B, S, 3), and ball radii shaped (B, 1).
     """
-    raise NotImplementedError
+    surface_records = surface_features[:, :-1].reshape(
+        surface_features.shape[0],
+        -1,
+        6,
+    )
+    return (
+        surface_records[:, :, :3],
+        surface_records[:, :, 3:],
+        surface_features[:, -1:],
+    )
 
 
 def find_closest_surface(
@@ -71,13 +91,15 @@ def find_closest_surface(
 
     @return: Long tensor shaped (B,), containing selected surface indices.
     """
-    raise NotImplementedError
+    position_offsets = torch.unsqueeze(positions, 1) - surface_centers
+    signed_distances = torch.sum(position_offsets * surface_normals, dim=2)
+    return torch.argmin(torch.abs(signed_distances), dim=1)
 
 
 def compute_surface_gap(
     positions: torch.Tensor,
-    surface_centers: torch.Tensor,
-    surface_normals: torch.Tensor,
+    surface_center: torch.Tensor,
+    surface_normal: torch.Tensor,
     ball_radii: torch.Tensor,
 ) -> torch.Tensor:
     """Compute signed ball-surface gaps for already-selected planes.
@@ -89,12 +111,18 @@ def compute_surface_gap(
 
     @param positions: Float tensor shaped (B, 3), containing ball-center XYZ
         positions in world coordinates.
-    @param surface_centers: Float tensor shaped (B, 3), containing the selected
+    @param surface_center: Float tensor shaped (B, 3), containing the selected
         point on each plane.
-    @param surface_normals: Float tensor shaped (B, 3), containing selected
+    @param surface_normal: Float tensor shaped (B, 3), containing the selected
         outward unit normals in world coordinates.
     @param ball_radii: Float tensor shaped (B, 1), containing ball radii.
 
     @return: Float tensor shaped (B, 1), containing signed surface gaps.
     """
-    raise NotImplementedError
+    center_offsets = positions - surface_center
+    signed_center_distances = torch.sum(
+        center_offsets * surface_normal,
+        dim=1,
+        keepdim=True,
+    )
+    return signed_center_distances - ball_radii

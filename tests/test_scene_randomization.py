@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
+import torch
 
 from sim.build_world import (
     OpposingRampsWorldBuilder,
@@ -13,6 +14,7 @@ from sim.cameras import transform_cameras
 from sim.scene_features import (
     OPPOSING_RAMPS_SCENE_FEATURE_SIZE,
     SIMPLE_ROLLING_SCENE_FEATURE_SIZE,
+    unpack_surface_features,
 )
 from sim.utilities.viz_utils import draw_ground_coordinate_lines
 
@@ -209,6 +211,48 @@ class SceneRandomizationTest(unittest.TestCase):
 
 
 class OpposingRampsRandomizationTest(unittest.TestCase):
+    def test_surface_features_use_final_entity_poses_and_include_ground(self):
+        world_builder = OpposingRampsWorldBuilder()
+        final_positions = {
+            "ramp_a": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            "ramp_b": [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+            "ground": [[13.0, 14.0, 15.0], [16.0, 17.0, 18.0]],
+        }
+
+        def make_entity(positions):
+            return SimpleNamespace(
+                get_pos=lambda: torch.tensor(positions),
+                get_quat=lambda: torch.tensor(
+                    [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]
+                ),
+            )
+
+        world = SimpleNamespace(
+            landscape={
+                name: make_entity(positions)
+                for name, positions in final_positions.items()
+            }
+        )
+
+        packed_features = world_builder.get_surface_features(world)
+        surface_centers, surface_normals, ball_radii = unpack_surface_features(
+            torch.from_numpy(packed_features)
+        )
+
+        expected_centers = torch.tensor(
+            [
+                [final_positions[name][batch_index] for name in final_positions]
+                for batch_index in range(2)
+            ]
+        )
+        expected_centers[:, :, 2] += torch.tensor([0.05, 0.05, 0.025])
+        torch.testing.assert_close(surface_centers, expected_centers)
+        torch.testing.assert_close(
+            surface_normals,
+            torch.tensor([[[0.0, 0.0, 1.0]] * 3] * 2),
+        )
+        torch.testing.assert_close(ball_radii, torch.full((2, 1), 0.2))
+
     def test_four_releases_share_each_scene_but_have_distinct_ball_positions(self):
         world_builder = OpposingRampsWorldBuilder()
         randomized_values = world_builder._create_randomized_opposing_ramp_values(
@@ -266,9 +310,9 @@ class OpposingRampsRandomizationTest(unittest.TestCase):
                 ramp_b_eulers[:, 1], ramp_b_eulers[:, 2]
             )
         )
-        ramp_length, ramp_width, ramp_thickness = (
-            world_builder.ramp_a_config.morph_params["size"]
-        )
+        ramp_length = world_builder.sampling_ramp_length
+        ramp_width = world_builder.sampling_ramp_width
+        ramp_thickness = world_builder.ramp_a_config.morph_params["size"][2]
         ramp_a_inner_edges = (
             ramp_a_positions
             - ramp_length / 2.0 * ramp_a_tangents
@@ -421,6 +465,40 @@ class OpposingRampsRandomizationTest(unittest.TestCase):
             [item.name for item in world_builder.config.landscape],
             ["ramp_a", "ramp_b", "ground"],
         )
+
+    def test_enlarged_ramps_preserve_the_original_sampling_distribution(self):
+        enlarged_builder = OpposingRampsWorldBuilder()
+        reference_builder = OpposingRampsWorldBuilder()
+        for ramp_config in (
+            reference_builder.ramp_a_config,
+            reference_builder.ramp_b_config,
+        ):
+            ramp_config.morph_params["size"] = [4.0, 5.0, 0.1]
+
+        enlarged_values = enlarged_builder._create_randomized_opposing_ramp_values(
+            np.random.default_rng(19),
+            n_environments=8,
+            trajectories_per_scene=4,
+        )
+        reference_values = reference_builder._create_randomized_opposing_ramp_values(
+            np.random.default_rng(19),
+            n_environments=8,
+            trajectories_per_scene=4,
+        )
+
+        self.assertEqual(
+            enlarged_builder.ramp_a_config.morph_params["size"],
+            [8.0, 10.0, 0.1],
+        )
+        self.assertEqual(
+            enlarged_builder.ramp_b_config.morph_params["size"],
+            [8.0, 10.0, 0.1],
+        )
+        for enlarged_value, reference_value in zip(
+            enlarged_values,
+            reference_values,
+        ):
+            np.testing.assert_array_equal(enlarged_value, reference_value)
 
     def test_simple_rolling_builder_declares_its_scene_feature_size(self):
         world_builder = load_world_builder("simple-rolling")

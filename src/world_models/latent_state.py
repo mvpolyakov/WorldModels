@@ -107,13 +107,27 @@ class ObservationEncoder(nn.Module):
         surface_centers, surface_normals, ball_radii = unpack_surface_features(
             surface_features
         )
-        surface_indices = find_closest_surface(positions, surface_centers, surface_normals)
+        selected_surface_index = find_closest_surface(
+            positions,
+            surface_centers,
+            surface_normals,
+        )
         batch_indices = torch.arange(positions.shape[0], device=positions.device)
-        selected_centers = surface_centers[batch_indices, surface_indices]
-        selected_normals = surface_normals[batch_indices, surface_indices]
-        gaps = compute_surface_gap(positions, selected_centers, selected_normals, ball_radii)
-        # 1 gap/selected_normal per sample in batch
-        return torch.cat([gaps, selected_normals], dim=1)
+        selected_surface_center = surface_centers[
+            batch_indices,
+            selected_surface_index,
+        ]
+        selected_surface_normal = surface_normals[
+            batch_indices,
+            selected_surface_index,
+        ]
+        surface_gap = compute_surface_gap(
+            positions,
+            selected_surface_center,
+            selected_surface_normal,
+            ball_radii,
+        )
+        return torch.cat([surface_gap, selected_surface_normal], dim=1)
 
     def forward(
         self,
@@ -142,8 +156,6 @@ class LatentStateModel(nn.Module):
     @param latent_size: L, the persistent latent width.
     @param observation_embedding_size: E, the encoded observation width.
     @param hidden_size: Width of the observation, update, and decoder hidden layers.
-    @param scene_feature_size: Width of the complete prepared encoder feature vector,
-        including position; distinct from the raw packed scene-record width F.
     @param warm_up_length: Number of observed frames before autonomous prediction.
     @param layer_norm_enabled: Whether hidden MLP layers use LayerNorm.
     """
@@ -169,7 +181,6 @@ class LatentStateModel(nn.Module):
         self.latent_size = latent_size
         self.observation_embedding_size = observation_embedding_size
         self.hidden_size = hidden_size
-        self.scene_feature_size = scene_feature_size
         self.warm_up_length = warm_up_length
         self.layer_norm_enabled = layer_norm_enabled
 

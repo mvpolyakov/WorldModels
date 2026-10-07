@@ -487,6 +487,8 @@ class OpposingRampsWorldBuilder(WorldBuilder):
     ball_clearance = 1e-4
     escape_height_margin = 0.02
     minimum_release_distance_fraction = 0.25
+    sampling_ramp_length = 4.0
+    sampling_ramp_width = 5.0
 
     def __init__(self):
         """Load the opposing ramps, ground, and ball configuration."""
@@ -518,7 +520,8 @@ class OpposingRampsWorldBuilder(WorldBuilder):
             ramp_euler = ramp_config.morph_params.get(
                 "euler", (0.0, 0.0, 0.0)
             )
-            ramp_length, _, ramp_thickness = ramp_config.morph_params["size"]
+            ramp_length = self.sampling_ramp_length
+            ramp_thickness = ramp_config.morph_params["size"][2]
             ramp_tangent, _, ramp_normal = self._get_surface_axes(
                 np.asarray([ramp_euler[1]], dtype=np.float32),
                 np.asarray([ramp_euler[2]], dtype=np.float32),
@@ -636,7 +639,7 @@ class OpposingRampsWorldBuilder(WorldBuilder):
         )
         gap_center_positions[:, :2] += scene_translations
 
-        ramp_width = self.ramp_a_config.morph_params["size"][1]
+        ramp_width = self.sampling_ramp_width
         clear_gap_widths = np.repeat(
             random_generator.uniform(
                 self.minimum_gap_clearance,
@@ -690,7 +693,8 @@ class OpposingRampsWorldBuilder(WorldBuilder):
             ramp_b_eulers[:, 1], ramp_b_eulers[:, 2]
         )
 
-        ramp_length, _, ramp_thickness = self.ramp_a_config.morph_params["size"]
+        ramp_length = self.sampling_ramp_length
+        ramp_thickness = self.ramp_a_config.morph_params["size"][2]
         ramp_a_positions = (
             ramp_a_inner_edge_centers
             + ramp_length / 2.0 * ramp_a_tangents

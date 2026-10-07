@@ -68,8 +68,8 @@ class SimulationTrajectoryCollector:
         )
 
         if use_surface_features:
-            scene_features = self.world_builder.get_surface_features(world)                    
-        else: 
+            scene_features = self.world_builder.get_surface_features(world)
+        else:
             scene_features = world.scene_features
 
         positions_by_step = [

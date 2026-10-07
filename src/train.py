@@ -733,7 +733,7 @@ def main() -> None:
         "latent_size": model.latent_size,
         "observation_embedding_size": model.observation_embedding_size,
         "hidden_size": model.hidden_size,
-        "scene_feature_size": model.scene_feature_size,
+        "scene_feature_size": model.observation_encoder.scene_feature_size,
         "scene_feature_schema": SURFACE_FEATURE_SCHEMA,
         "warm_up_length": model.warm_up_length,
         "layer_norm_enabled": model.layer_norm_enabled,

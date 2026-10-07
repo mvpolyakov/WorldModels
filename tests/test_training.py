@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, Mock, patch
 
 import numpy as np
 import torch
@@ -50,6 +50,32 @@ class RecordingPositionModel(nn.Module):
 
 
 class TrainingTest(unittest.TestCase):
+    def test_sequence_collection_requests_packed_surface_features(self):
+        positions = torch.zeros((2, 3))
+        world = SimpleNamespace(
+            mobiles={"ball": SimpleNamespace(get_pos=lambda: positions)},
+            scene_features=np.full((2, 10), -1.0, dtype=np.float32),
+            step=lambda: None,
+        )
+        packed_surface_features = np.full((2, 13), 2.0, dtype=np.float32)
+        world_builder = SimpleNamespace(
+            config=SimpleNamespace(mobiles=[object()]),
+            build=lambda **_: (world, None),
+            get_surface_features=Mock(return_value=packed_surface_features),
+        )
+
+        _, collected_features = SimulationTrajectoryCollector(
+            world_builder
+        ).collect_randomized_batch(
+            steps=5,
+            n_environments=2,
+            random_generator=np.random.default_rng(1),
+            use_surface_features=True,
+        )
+
+        world_builder.get_surface_features.assert_called_once_with(world)
+        np.testing.assert_array_equal(collected_features, packed_surface_features)
+
     def test_position_history_model_predict_integrates_displacement(self):
         model = PositionHistoryMLP(
             history_length=2,
