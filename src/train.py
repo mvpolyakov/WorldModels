@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from sim.build_world import load_world_builder
+from sim.scene_features import SURFACE_FEATURE_SCHEMA
 from training.trajectories import (
     TrajectorySliceDataset,
     create_trajectory_sequence_dataset,
@@ -704,7 +705,6 @@ def main() -> None:
         latent_size=args.latent_size,
         observation_embedding_size=args.observation_embedding_size,
         hidden_size=args.hidden_size,
-        scene_feature_size=world_builder.scene_feature_size,
         warm_up_length=WARMUP_LENGTH,
         layer_norm_enabled=args.layer_norm,
     ).to(device)
@@ -734,6 +734,7 @@ def main() -> None:
         "observation_embedding_size": model.observation_embedding_size,
         "hidden_size": model.hidden_size,
         "scene_feature_size": model.scene_feature_size,
+        "scene_feature_schema": SURFACE_FEATURE_SCHEMA,
         "warm_up_length": model.warm_up_length,
         "layer_norm_enabled": model.layer_norm_enabled,
         "prediction_horizon": PREDICTION_HORIZON,
@@ -785,6 +786,7 @@ def main() -> None:
         positions=saved_positions,
         trajectory_lengths=trajectory_lengths,
         scene_features=saved_scene_features,
+        scene_feature_schema=SURFACE_FEATURE_SCHEMA,
     )
     torch.save(checkpoint, output_dir / "checkpoint.tar")
     (output_dir / "metrics.json").write_text(

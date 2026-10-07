@@ -20,6 +20,7 @@ from .scene_config import SceneConfig, ObjectConfig
 from .scene_features import (
     OPPOSING_RAMPS_SCENE_FEATURE_SIZE,
     SIMPLE_ROLLING_SCENE_FEATURE_SIZE,
+    pack_surface_features,
 )
 from .utilities.sim_utils import TrajectoryRecorder
 
@@ -38,6 +39,35 @@ class WorldBuilder(ABC):
 
     config: SceneConfig
     scene_feature_size: int
+
+    def get_surface_features(self, world: World) -> np.ndarray:
+        """Collect post-randomization landscape box poses for the top-plane geometry helper.
+
+        Call after scene randomization and before collecting observations.
+
+        @return: Packed surface records and radius shaped (B, 6*S + 1), where
+            B is environment count and S is landscape box count, including ground.
+        """
+        box_centers = []
+        rotation_matrices = []
+        box_thicknesses = []
+        for box_config in self.config.landscape:
+            box = world.landscape[box_config.name]
+            box_centers.append(box.get_pos().detach().cpu().numpy())
+            quaternions = box.get_quat().detach().cpu().numpy()
+            rotation_matrices.append(np.asarray(gs.utils.geom.quat_to_R(quaternions)))
+            box_thicknesses.append(box_config.morph_params["size"][2])
+        ball_radii = np.full(
+            (box_centers[0].shape[0], 1),
+            self.config.mobiles[0].morph_params["radius"],
+            dtype=np.float32,
+        )
+        return pack_surface_features(
+            np.stack(box_centers, axis=1),
+            np.stack(rotation_matrices, axis=1),
+            np.asarray(box_thicknesses, dtype=np.float32),
+            ball_radii,
+        )
 
     @staticmethod
     def _get_randomized_scene_count(

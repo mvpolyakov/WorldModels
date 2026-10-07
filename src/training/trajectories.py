@@ -10,7 +10,7 @@ from sim.build_world import WorldBuilder
 
 #MIN_MOVEMENT = 0.001 # min object displacement to keep collecting trajectory
 MIN_MOVEMENT = 0 # actually do want to have samples of near static objects - this pretty much eliminates it
-TRAJECTORIES_PER_SCENE = 8
+TRAJECTORIES_PER_SCENE = 4
 
 
 def _round_up_trajectory_count(n_trajectories: int) -> int:
@@ -52,8 +52,10 @@ class SimulationTrajectoryCollector:
         n_environments: int,
         random_generator: np.random.Generator,
         trajectories_per_scene: int = 1,
+        *,
+        use_surface_features: bool = False,
     ) -> tuple[list[np.ndarray], np.ndarray]:
-        """Collect trajectories and their static ramp/radius features."""
+        """Collect trajectories with static pose or top-plane/radius features."""
         if steps < 5:
             raise ValueError("Collect at least 5 simulator steps.")
 
@@ -64,6 +66,11 @@ class SimulationTrajectoryCollector:
             random_generator=random_generator,
             trajectories_per_scene=trajectories_per_scene,
         )
+
+        if use_surface_features:
+            scene_features = self.world_builder.get_surface_features(world)                    
+        else: 
+            scene_features = world.scene_features
 
         positions_by_step = [
             world.mobiles["ball"].get_pos().detach().cpu().numpy().copy()
@@ -105,7 +112,7 @@ class SimulationTrajectoryCollector:
             positions[:trajectory_end_indices[environment_index], environment_index, :]
             for environment_index in range(n_environments)
         ]
-        return trajectories, world.scene_features.astype(np.float32)
+        return trajectories, scene_features.astype(np.float32)
 
 
 class PositionHistoryDataset(Dataset):
@@ -516,6 +523,7 @@ def create_trajectory_sequence_dataset(
         n_environments=n_trajectories,
         random_generator=random_generator,
         trajectories_per_scene=TRAJECTORIES_PER_SCENE,
+        use_surface_features=True,
     )
     training_trajectory_count = _get_training_trajectory_count(n_trajectories)
 

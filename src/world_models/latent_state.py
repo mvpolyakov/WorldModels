@@ -1,7 +1,11 @@
 import torch
 from torch import nn
 
-from sim.scene_features import OPPOSING_RAMPS_SCENE_FEATURE_SIZE
+from sim.scene_features import (
+    compute_surface_gap,
+    find_closest_surface,
+    unpack_surface_features,
+)
 
 
 def _build_mlp(
@@ -58,17 +62,88 @@ def _build_mlp2(
     return nn.Sequential(*layers)
 
 
+class ObservationEncoder(nn.Module):
+    """Convert raw observations into embeddings for latent-state updates.
+
+    The coordinate input path prepares position, closest-surface gap and normal,
+    and radius before applying the learned network. B is batch size, S is surface
+    count, and E is embedding width.
+    """
+
+    # A function of its encoding process = 3 (closest surface normal) +
+    #                                      1 (gap) +
+    #                                      1 (ball radius) +
+    #                                      3 (ball position) 
+    scene_feature_size = 8 
+
+    def __init__(
+        self,
+        observation_embedding_size: int,
+        hidden_size: int,
+        *,
+        layer_norm_enabled: bool,
+    ):
+        """Size the network from the caller's prepared feature-vector width."""
+        super().__init__()
+        self.network = _build_mlp(
+            self.scene_feature_size,
+            observation_embedding_size,
+            hidden_size,
+            layer_norm_enabled=layer_norm_enabled,
+        )
+
+    def compute_closest_surface_context(
+        self,
+        positions: torch.Tensor,
+        surface_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select a plane and assemble its context for each observation.
+
+        @param positions: Observed ball-center XYZ positions, shape (B, 3).
+        @param surface_features: Packed plane records and radius, shape (B, 6*S + 1).
+
+        @return: Signed gap and selected outward normal XYZ, shape (B, 4).
+        """
+        surface_centers, surface_normals, ball_radii = unpack_surface_features(
+            surface_features
+        )
+        surface_indices = find_closest_surface(positions, surface_centers, surface_normals)
+        batch_indices = torch.arange(positions.shape[0], device=positions.device)
+        selected_centers = surface_centers[batch_indices, surface_indices]
+        selected_normals = surface_normals[batch_indices, surface_indices]
+        gaps = compute_surface_gap(positions, selected_centers, selected_normals, ball_radii)
+        # 1 gap/selected_normal per sample in batch
+        return torch.cat([gaps, selected_normals], dim=1)
+
+    def forward(
+        self,
+        position: torch.Tensor,
+        scene_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode raw coordinates and scene geometry into an observation embedding.
+
+        @param position: Observed ball-center XYZ positions, shape (B, 3).
+        @param scene_features: Packed plane records and radius, shape (B, 6*S + 1).
+
+        @return: Learned observation embedding, shape (B, E).
+        """
+        surface_context = self.compute_closest_surface_context(position, scene_features)
+        ball_radii = scene_features[:, -1:]
+        return self.network(torch.cat([position, surface_context, ball_radii], dim=1))
+
+
 class LatentStateModel(nn.Module):
     """Encode observations and predict a caller-owned latent state through time.
 
     B is batch size, L is latent size, E is observation embedding size, and F
-    is scene-feature size. The model
+    is packed surface-feature size (6*S + 1 for S surfaces). The model
     operates on one object per row; it never stores a row's current state.
 
     @param latent_size: L, the persistent latent width.
     @param observation_embedding_size: E, the encoded observation width.
     @param hidden_size: Width of the observation, update, and decoder hidden layers.
-    @param scene_feature_size: F, the static scene-context width.
+    @param scene_feature_size: Width of the complete prepared encoder feature vector,
+        including position; distinct from the raw packed scene-record width F.
     @param warm_up_length: Number of observed frames before autonomous prediction.
     @param layer_norm_enabled: Whether hidden MLP layers use LayerNorm.
     """
@@ -77,7 +152,6 @@ class LatentStateModel(nn.Module):
         self,
         latent_size: int = 64,
         hidden_size: int = 64,
-        scene_feature_size: int = OPPOSING_RAMPS_SCENE_FEATURE_SIZE,
         warm_up_length: int = 5,
         *,
         observation_embedding_size: int,
@@ -89,8 +163,8 @@ class LatentStateModel(nn.Module):
             raise ValueError("latent_size and hidden_size must be positive.")
         if observation_embedding_size < 1:
             raise ValueError("observation_embedding_size must be positive.")
-        if scene_feature_size < 1 or warm_up_length < 1:
-            raise ValueError("scene_feature_size and warm_up_length must be positive.")
+        if warm_up_length < 1:
+            raise ValueError("warm_up_length must be positive.")
 
         self.latent_size = latent_size
         self.observation_embedding_size = observation_embedding_size
@@ -100,8 +174,7 @@ class LatentStateModel(nn.Module):
         self.layer_norm_enabled = layer_norm_enabled
 
         # Component models
-        self.observation_encoder = _build_mlp(
-            3 + scene_feature_size,                 # 3=position of a single object
+        self.observation_encoder = ObservationEncoder(
             observation_embedding_size,
             hidden_size,
             layer_norm_enabled=layer_norm_enabled,
@@ -159,11 +232,11 @@ class LatentStateModel(nn.Module):
         """Encode an observed position and scene context for a state update.
 
         @param position: Float tensor with shape (B, 3), containing XYZ positions.
-        @param scene_features: Float tensor with shape (B, F).
+        @param scene_features: Packed top-plane records and radius, shape (B, F).
 
         @return: Observation embedding with shape (B, E).
         """
-        return self.observation_encoder(torch.cat([position, scene_features], dim=1))
+        return self.observation_encoder(position, scene_features)
 
     def update_state(
         self,
