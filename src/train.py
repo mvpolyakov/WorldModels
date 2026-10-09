@@ -1,7 +1,6 @@
 import argparse
 import json
 import random
-from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +12,10 @@ from sim.scene_features import SURFACE_FEATURE_SCHEMA
 from training.trajectories import (
     TrajectorySliceDataset,
     create_trajectory_sequence_dataset,
+)
+from training_profiling_utils import (
+    _compute_baseline_position_error_sums,
+    _compute_gradient_norm,
 )
 from world_models import LatentStateModel
 
@@ -296,7 +299,8 @@ def _compute_batch_losses(
     @param padding_frame_mask: Boolean tensor (B, T); True marks trailing padding.
     @param compute_penetration_loss: Whether to calculate penetration errors.
 
-    @return: Scalar tensors position_loss, penetration_loss, reconstruction_loss,
+    @return: Scalar tensors position_loss, its matched constant-position and
+        constant-velocity baselines, penetration_loss, reconstruction_loss,
         consistency_loss, and latent_std; their integer aggregation counts and
         observed_frame_count. Forecast losses are zero when no frames remain
         after warm-up.
@@ -338,6 +342,15 @@ def _compute_batch_losses(
         padding_frame_mask,
         compute_penetration_loss,
     )
+    (
+        constant_position_error_sum,
+        constant_velocity_error_sum,
+    ) = _compute_baseline_position_error_sums(
+        observed_positions,
+        padding_frame_mask,
+        WARMUP_LENGTH,
+        PREDICTION_HORIZON,
+    )
 
     # Average over scored scalar values, not padded frames or trajectory count.
     # A frame can be scored by several forecasts starting at different times.
@@ -347,6 +360,12 @@ def _compute_batch_losses(
     observed_states = observation_states[~padding_frame_mask]
     return {
         "position_loss": position_error_sum / max(position_element_count, 1),
+        "constant_position_loss": (
+            constant_position_error_sum / max(position_element_count, 1)
+        ),
+        "constant_velocity_loss": (
+            constant_velocity_error_sum / max(position_element_count, 1)
+        ),
         "penetration_loss": penetration_error_sum / max(
             penetration_element_count,
             1,
@@ -360,24 +379,6 @@ def _compute_batch_losses(
         "consistency_element_count": consistency_element_count,
         "observed_frame_count": observed_frame_count,
     }
-
-
-def _compute_gradient_norm(parameters: Iterable[torch.nn.Parameter]) -> float:
-    """Compute the combined L2 norm of the available parameter gradients.
-
-    @param parameters: Model parameters whose gradients will be measured. Parameters
-        without a gradient are excluded.
-
-    @return: The scalar L2 norm across all supplied gradients.
-    """
-    parameter_gradient_norms = [
-        parameter.grad.detach().norm(2)
-        for parameter in parameters
-        if parameter.grad is not None
-    ]
-    if not parameter_gradient_norms:
-        return 0.0
-    return torch.stack(parameter_gradient_norms).norm(2).item()
 
 
 def _build_batch_metrics(
@@ -402,6 +403,8 @@ def _build_batch_metrics(
     """
     batch_metrics = {
         "position_loss": losses["position_loss"].item(),
+        "constant_position_loss": losses["constant_position_loss"].item(),
+        "constant_velocity_loss": losses["constant_velocity_loss"].item(),
         "penetration_loss": losses["penetration_loss"].item(),
         "reconstruction_loss": losses["reconstruction_loss"].item(),
         "consistency_loss": losses["consistency_loss"].item(),
@@ -464,6 +467,8 @@ def _process_epoch_pass(
     """
     metric_sums = {
         "position_loss": 0.0,
+        "constant_position_loss": 0.0,
+        "constant_velocity_loss": 0.0,
         "penetration_loss": 0.0,
         "reconstruction_loss": 0.0,
         "consistency_loss": 0.0,
@@ -471,6 +476,8 @@ def _process_epoch_pass(
     }
     metric_counts = {
         "position_loss": 0,
+        "constant_position_loss": 0,
+        "constant_velocity_loss": 0,
         "penetration_loss": 0,
         "reconstruction_loss": 0,
         "consistency_loss": 0,
@@ -516,6 +523,8 @@ def _process_epoch_pass(
 
         counts = {
             "position_loss": losses["position_element_count"],
+            "constant_position_loss": losses["position_element_count"],
+            "constant_velocity_loss": losses["position_element_count"],
             "penetration_loss": losses["penetration_element_count"],
             "reconstruction_loss": losses["reconstruction_element_count"],
             "consistency_loss": losses["consistency_element_count"],
@@ -614,6 +623,53 @@ def _roll_out_model(
     return torch.stack(predicted_positions, dim=1)
 
 
+def _compute_trajectory_baseline_losses(
+    actual_positions: torch.Tensor,
+    history_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute ten-frame baseline MSE at each forecast start in a trajectory.
+
+    A result at rollout index zero starts from the final warm-up frame. Starts
+    without a complete PREDICTION_HORIZON future are left as NaN so every plotted
+    point summarizes the same number of forecast offsets.
+
+    @param actual_positions: Complete XYZ trajectory shaped (T, 3).
+    @param history_length: Number of initial observations used before rollout.
+
+    @return: Constant-position and constant-velocity MSE vectors, each shaped
+        (T - history_length,). Trailing entries without ten targets are NaN.
+    """
+    rollout_length = len(actual_positions) - history_length
+    constant_position_losses = actual_positions.new_full((rollout_length,), torch.nan)
+    constant_velocity_losses = actual_positions.new_full((rollout_length,), torch.nan)
+    forecast_offsets = torch.arange(
+        1,
+        PREDICTION_HORIZON + 1,
+        device=actual_positions.device,
+    )
+
+    for rollout_frame, forecast_start_frame in enumerate(
+        range(history_length - 1, len(actual_positions) - PREDICTION_HORIZON)
+    ):
+        start_position = actual_positions[forecast_start_frame]
+        previous_position = actual_positions[forecast_start_frame - 1]
+        target_positions = actual_positions[
+            forecast_start_frame + forecast_offsets
+        ]
+        constant_position_losses[rollout_frame] = (
+            target_positions - start_position
+        ).square().mean()
+        constant_velocity_predictions = start_position + torch.unsqueeze(
+            forecast_offsets,
+            -1,
+        ) * (start_position - previous_position)
+        constant_velocity_losses[rollout_frame] = (
+            target_positions - constant_velocity_predictions
+        ).square().mean()
+
+    return constant_position_losses, constant_velocity_losses
+
+
 @torch.inference_mode()
 def _compute_full_trajectory_rollouts(model, validation_dataset, device):
     """Predict every validation trajectory after its observation warm-up.
@@ -627,7 +683,7 @@ def _compute_full_trajectory_rollouts(model, validation_dataset, device):
     @param device: Torch device used for prediction and error calculation.
 
     @return: One dictionary per trajectory containing actual and predicted XYZ
-        positions plus position, velocity, and velocity-innovation errors.
+        positions; model errors; and time-indexed ten-frame baseline losses.
     """
     trajectory_rollouts = []
 
@@ -663,6 +719,13 @@ def _compute_full_trajectory_rollouts(model, validation_dataset, device):
             dim=0,
             prepend=torch.zeros_like(velocity_errors[:1]),
         )
+        (
+            constant_position_losses,
+            constant_velocity_losses,
+        ) = _compute_trajectory_baseline_losses(
+            actual_positions,
+            history_length,
+        )
 
         trajectory_rollouts.append(
             {
@@ -671,6 +734,8 @@ def _compute_full_trajectory_rollouts(model, validation_dataset, device):
                 "position_errors": position_errors.cpu().numpy(),
                 "velocity_errors": velocity_errors.cpu().numpy(),
                 "velocity_error_innovations": velocity_error_innovations.cpu().numpy(),
+                "constant_position_losses": constant_position_losses.cpu().numpy(),
+                "constant_velocity_losses": constant_velocity_losses.cpu().numpy(),
             }
         )
 
@@ -798,11 +863,12 @@ def _store_validation_rollouts(validation_trajectory_rollouts, output_dir):
     max_validation_rollout_length = validation_rollout_lengths.max()
     saved_validation_rollouts = {}
     for key in validation_trajectory_rollouts[0]:
+        trailing_shape = validation_trajectory_rollouts[0][key].shape[1:]
         values = np.full(
             (
                 len(validation_trajectory_rollouts),
                 max_validation_rollout_length,
-                3,
+                *trailing_shape,
             ),
             np.nan,
             dtype=np.float32,
