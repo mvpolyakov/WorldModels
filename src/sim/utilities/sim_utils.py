@@ -119,14 +119,15 @@ class PredictionWorld:
         if self._uses_recurrent_state:
             batch_size, mobile_count = self.mobile_positions.shape[:2]
             with torch.inference_mode():
-                predicted_positions, self.latent_state = self.model(
+                predicted_displacements, self.latent_state = self.model(
                     self.latent_state
                 )
-            predicted_positions = predicted_positions.reshape(
+            predicted_displacements = predicted_displacements.reshape(
                 batch_size,
                 mobile_count,
                 3,
             ).cpu().numpy()
+            predicted_positions = self.mobile_positions + predicted_displacements
             self._state_needs_observation_update = True
         else:
 

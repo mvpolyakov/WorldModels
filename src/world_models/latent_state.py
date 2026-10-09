@@ -164,8 +164,10 @@ class LatentStateModel(nn.Module):
 
         # Component models
         self.observation_encoder = ObservationEncoder()
+        self.previous_encoded_observation = None # for diffing
+
         self.state_updater = _build_mlp(
-            latent_size + self.observation_encoder.scene_feature_size,
+            latent_size + 2 * self.observation_encoder.scene_feature_size,
             latent_size,
             hidden_size,
             layer_norm_enabled=layer_norm_enabled,
@@ -202,6 +204,7 @@ class LatentStateModel(nn.Module):
 
         @return: Zero latent tensor with shape (B, L).
         """
+        self.previous_encoded_observation = None
         reference = next(self.parameters())
         return torch.zeros(
             (batch_size, self.latent_size),
@@ -221,7 +224,17 @@ class LatentStateModel(nn.Module):
 
         @return: Observation embedding with shape (B, E).
         """
-        return self.observation_encoder(position, scene_features)
+        encoded_observation = self.observation_encoder(position, scene_features)
+
+        if self.previous_encoded_observation is None:
+            self.previous_encoded_observation = encoded_observation
+
+        encoded_difference = encoded_observation - \
+                                self.previous_encoded_observation
+
+        self.previous_encoded_observation = encoded_observation
+
+        return torch.cat([encoded_observation, encoded_difference], dim=1)
 
     def update_state(
         self,
@@ -252,14 +265,14 @@ class LatentStateModel(nn.Module):
         return state + self.dynamics_model(state)
 
     def decode_state(self, state: torch.Tensor) -> torch.Tensor:
-        """Decode absolute XYZ positions from latent states.
+        """Decode XYZ displacements from latent states.
 
         B is trajectory batch size, R is forecast-start count, and L is latent
         width.
 
         @param state: Latent tensor with shape (B, L) or (B, R, L).
 
-        @return: Absolute XYZ positions with shape (B, 3) or (B, R, 3).
+        @return: XYZ displacements with shape (B, 3) or (B, R, 3).
         """
         return self.latent_state_decoder(state)
 
@@ -290,11 +303,12 @@ class LatentStateModel(nn.Module):
         return self.update_state(prior_state, observation_embedding)
 
     def forward(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Predict one frame and decode its absolute position.
+        """Predict one frame and decode its displacement.
 
         @param state: Current latent with shape (B, L).
 
-        @return: Tuple of predicted XYZ positions (B, 3) and next latent (B, L).
+        @return: Tuple of predicted XYZ displacements (B, 3) and next latent
+            (B, L). The caller adds the displacement to its current position.
         """
         next_state = self.predict_state(state)
         return self.decode_state(next_state), next_state

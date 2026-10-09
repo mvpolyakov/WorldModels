@@ -221,6 +221,7 @@ def _compute_autonomous_rollout_error_sums(
         device=observed_positions.device,
     )
     predicted_states = observation_states[:, forecast_start_frames]
+    predicted_positions = observed_positions[:, forecast_start_frames]
     maximum_forecast_offset = min(
         PREDICTION_HORIZON,
         forecast_start_count,
@@ -235,7 +236,10 @@ def _compute_autonomous_rollout_error_sums(
         predicted_states = model.predict_state(
             predicted_states[:, :active_start_count]
         )
-        predicted_positions = model.decode_state(predicted_states)
+        predicted_positions = (
+            predicted_positions[:, :active_start_count]
+            + model.decode_state(predicted_states)
+        )
         target_positions = observed_positions[:, target_frames]
         forecast_padding_mask = (
             padding_frame_mask[:, active_start_frames]
@@ -315,19 +319,21 @@ def _compute_batch_losses(
     )
     observed_frame_count = int((~padding_frame_mask).sum().item())
 
-    # Decode each observation-updated state to train the encoder and updater.
-    # Flatten trajectory/time axes for the decoder, then restore the frame layout.
-    reconstructed_positions = model.decode_state(
-        observation_states.reshape(
-            batch_size * padded_frame_count,
+    # Frame zero has no preceding observation and therefore no displacement target.
+    consecutive_frame_pair_count = max(padded_frame_count - 1, 0)
+    reconstructed_positions = observed_positions[:, :-1] + model.decode_state(
+        observation_states[:, 1:].reshape(
+            batch_size * consecutive_frame_pair_count,
             model.latent_size,
         )
-    ).reshape(batch_size, padded_frame_count, position_size)
+    ).reshape(batch_size, consecutive_frame_pair_count, position_size)
     reconstruction_error_sum = torch.sum(
-        (reconstructed_positions - observed_positions) ** 2
-        * (~padding_frame_mask).unsqueeze(-1)
+        (reconstructed_positions - observed_positions[:, 1:]) ** 2
+        * (~padding_frame_mask[:, 1:]).unsqueeze(-1)
     )
-    reconstruction_element_count = observed_frame_count * position_size
+    reconstruction_element_count = int(
+        (~padding_frame_mask[:, 1:]).sum().item()
+    ) * position_size
 
     (
         position_error_sum,
@@ -613,9 +619,11 @@ def _roll_out_model(
     # actually do autonomous rollout
     
     predicted_positions = []
+    current_position = observed_positions[:, -1]
     for _ in range(prediction_count):
-        predicted_position, state = model(state)
-        predicted_positions.append(predicted_position)
+        predicted_displacement, state = model(state)
+        current_position = current_position + predicted_displacement
+        predicted_positions.append(current_position)
 
     if len(predicted_positions) == 0:
         return observed_positions.new_empty((observed_positions.shape[0], 0, 3))
