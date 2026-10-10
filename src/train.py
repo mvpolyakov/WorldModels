@@ -1006,6 +1006,8 @@ def main() -> None:
         "scene_feature_schema": SURFACE_FEATURE_SCHEMA,
         "warm_up_length": model.warm_up_length,
         "layer_norm_enabled": model.layer_norm_enabled,
+        "dynamics_output_weight_gain": model.dynamics_output_weight_gain,
+        "decoder_output_weight_gain": model.decoder_output_weight_gain,
         "prediction_horizon": PREDICTION_HORIZON,
         "state_dict": model.state_dict(),
         "training_metadata": {

@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -18,14 +20,16 @@ from sim.scene_features import (
 from sim.utilities.sim_utils import PredictionWorld
 from train import (
     _compute_batch_losses,
-    _compute_gradient_norm,
     _compute_observation_states,
+    _compute_trajectory_baseline_losses,
     _roll_out_model,
+    _store_validation_rollouts,
     _compute_consistency_error_sum,
     _process_epoch_pass,
     get_args as get_training_args,
 )
 from training import TrajectorySequenceDataset, TrajectorySliceDataset
+from training_profiling_utils import _compute_gradient_norm
 from world_models import LatentStateModel, PositionHistoryMLP
 
 SURFACE_ENCODER_FEATURE_SIZE = 8
@@ -295,6 +299,43 @@ class LatentStateTest(unittest.TestCase):
         )
         self.assertFalse(loaded_model.layer_norm_enabled)
 
+    def test_observation_difference_uses_previous_frame_and_resets(self):
+        model = LatentStateModel(latent_size=4, hidden_size=8)
+        first_positions = torch.zeros((2, 3))
+        second_positions = torch.ones((2, 3))
+        scene_features = torch.from_numpy(_surface_features(2))
+
+        model.initialize_state(2)
+        first_embedding = model.encode_observation(
+            first_positions,
+            scene_features,
+        )
+        second_embedding = model.encode_observation(
+            second_positions,
+            scene_features,
+        )
+        embedding_size = model.observation_encoder.scene_feature_size
+
+        torch.testing.assert_close(
+            first_embedding[:, embedding_size:],
+            first_embedding[:, :embedding_size],
+        )
+        torch.testing.assert_close(
+            second_embedding[:, embedding_size:],
+            second_embedding[:, :embedding_size]
+            - first_embedding[:, :embedding_size],
+        )
+
+        model.initialize_state(1)
+        reset_embedding = model.encode_observation(
+            torch.ones((1, 3)),
+            torch.from_numpy(_surface_features(1)),
+        )
+        torch.testing.assert_close(
+            reset_embedding[:, embedding_size:],
+            reset_embedding[:, :embedding_size],
+        )
+
     def test_layer_norm_follows_each_hidden_linear_layer(self):
         model = LatentStateModel(
             latent_size=4,
@@ -319,6 +360,39 @@ class LatentStateTest(unittest.TestCase):
                 self.assertIsInstance(modules[index - 1], torch.nn.Linear)
                 self.assertIsInstance(modules[index + 1], torch.nn.ReLU)
             self.assertIsInstance(modules[-1], torch.nn.Linear)
+
+    def test_mlp_initialization_uses_zero_biases_and_small_output_weights(self):
+        model = LatentStateModel(
+            latent_size=8,
+            hidden_size=4,
+            layer_norm_enabled=True,
+        )
+
+        for network in (
+            model.state_updater,
+            model.dynamics_model,
+            model.latent_state_decoder,
+        ):
+            for layer in network:
+                if isinstance(layer, torch.nn.Linear):
+                    torch.testing.assert_close(
+                        layer.bias,
+                        torch.zeros_like(layer.bias),
+                    )
+
+        output_gains = {
+            model.dynamics_model: model.dynamics_output_weight_gain,
+            model.latent_state_decoder: model.decoder_output_weight_gain,
+        }
+        for network, output_gain in output_gains.items():
+            output_layer = network[-1]
+            fan_out, fan_in = output_layer.weight.shape
+            xavier_bound = output_gain * (6.0 / (fan_in + fan_out)) ** 0.5
+            self.assertGreater(torch.count_nonzero(output_layer.weight).item(), 0)
+            self.assertLessEqual(
+                output_layer.weight.abs().max().item(),
+                xavier_bound,
+            )
 
     def test_observation_corrects_a_predicted_frame_without_advancing_again(self):
         predicted_world = PredictionWorld(
@@ -366,7 +440,7 @@ class LatentStateTest(unittest.TestCase):
         self.assertEqual(predicted_position.shape, (2, 3))
         self.assertEqual(predicted_state.shape, (2, 4))
 
-    def test_latent_decoder_returns_absolute_position(self):
+    def test_latent_decoder_returns_displacement(self):
         model = LatentStateModel(
             latent_size=2,
             hidden_size=4,
@@ -378,14 +452,14 @@ class LatentStateTest(unittest.TestCase):
                 torch.tensor([0.5, -0.5, 1.0])
             )
 
-        predicted_position = model.decode_state(torch.zeros((1, 2)))
+        predicted_displacement = model.decode_state(torch.zeros((1, 2)))
 
         torch.testing.assert_close(
-            predicted_position,
+            predicted_displacement,
             torch.tensor([[0.5, -0.5, 1.0]]),
         )
 
-    def test_latent_rollout_uses_decoded_absolute_positions(self):
+    def test_latent_rollout_accumulates_decoded_displacements(self):
         model = LatentStateModel(
             latent_size=2,
             hidden_size=4,
@@ -412,11 +486,11 @@ class LatentStateTest(unittest.TestCase):
         torch.testing.assert_close(
             predicted_positions,
             torch.tensor(
-                [[[0.5, -0.5, 1.0], [0.5, -0.5, 1.0], [0.5, -0.5, 1.0]]]
+                [[[2.5, 1.5, 3.0], [3.0, 1.0, 4.0], [3.5, 0.5, 5.0]]]
             ),
         )
 
-    def test_constant_position_decoder_reconstructs_and_forecasts_static_motion(self):
+    def test_constant_displacement_decoder_reconstructs_and_forecasts_linear_motion(self):
         model = LatentStateModel(
             latent_size=2,
             hidden_size=4,
@@ -426,7 +500,11 @@ class LatentStateTest(unittest.TestCase):
             for parameter in model.latent_state_decoder.parameters():
                 parameter.zero_()
             model.latent_state_decoder[-1].bias.fill_(1.0)
-        positions = torch.ones((1, 5, 3))
+        positions = (
+            torch.arange(5, dtype=torch.float32)
+            .reshape(1, 5, 1)
+            .expand(-1, -1, 3)
+        )
 
         losses = _compute_batch_losses(
             model,
@@ -438,6 +516,76 @@ class LatentStateTest(unittest.TestCase):
 
         self.assertEqual(losses["reconstruction_loss"].item(), 0.0)
         self.assertEqual(losses["position_loss"].item(), 0.0)
+
+    def test_baselines_use_all_model_forecast_starts_and_horizons(self):
+        model = LatentStateModel(
+            latent_size=2,
+            hidden_size=4,
+            warm_up_length=5,
+        )
+        positions = (
+            torch.arange(15, dtype=torch.float32)
+            .reshape(1, 15, 1)
+            .expand(-1, -1, 3)
+        )
+
+        losses = _compute_batch_losses(
+            model,
+            positions,
+            torch.from_numpy(_surface_features(1)),
+            torch.zeros((1, 15), dtype=torch.bool),
+            compute_penetration_loss=False,
+        )
+
+        self.assertEqual(losses["position_element_count"], 165)
+        self.assertEqual(losses["constant_velocity_loss"].item(), 0.0)
+        self.assertEqual(losses["constant_position_loss"].item(), 22.0)
+
+    def test_trajectory_baseline_losses_change_with_forecast_start(self):
+        frame_positions = torch.arange(20, dtype=torch.float32).pow(3)
+        positions = frame_positions.reshape(20, 1).expand(-1, 3)
+
+        constant_position_losses, constant_velocity_losses = (
+            _compute_trajectory_baseline_losses(
+                positions,
+                history_length=5,
+            )
+        )
+
+        self.assertTrue(
+            torch.all(torch.diff(constant_position_losses[:6]) > 0)
+        )
+        self.assertTrue(
+            torch.all(torch.diff(constant_velocity_losses[:6]) > 0)
+        )
+        self.assertTrue(torch.all(torch.isnan(constant_position_losses[6:])))
+        self.assertTrue(torch.all(torch.isnan(constant_velocity_losses[6:])))
+
+    def test_validation_rollout_storage_supports_scalar_losses(self):
+        trajectory_rollouts = [
+            {
+                "position_errors": np.zeros((2, 3), dtype=np.float32),
+                "constant_position_losses": np.asarray(
+                    [1.0, 2.0],
+                    dtype=np.float32,
+                ),
+            },
+            {
+                "position_errors": np.zeros((1, 3), dtype=np.float32),
+                "constant_position_losses": np.asarray([3.0], dtype=np.float32),
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _store_validation_rollouts(
+                trajectory_rollouts,
+                Path(temporary_directory),
+            )
+            saved_path = Path(temporary_directory) / "validation_rollouts.npz"
+            with np.load(saved_path) as saved:
+                self.assertEqual(saved["position_errors"].shape, (2, 2, 3))
+                self.assertEqual(saved["constant_position_losses"].shape, (2, 2))
+                self.assertTrue(np.isnan(saved["constant_position_losses"][1, 1]))
 
     def test_autonomous_rollout_batches_forecast_starts_by_horizon(self):
         model = LatentStateModel(
@@ -521,7 +669,13 @@ class LatentStateTest(unittest.TestCase):
                 [False, False, False, False, False, False, False, False],
             ]),
         )
-        for name in ("position_loss", "reconstruction_loss", "consistency_loss"):
+        for name in (
+            "position_loss",
+            "constant_position_loss",
+            "constant_velocity_loss",
+            "reconstruction_loss",
+            "consistency_loss",
+        ):
             torch.testing.assert_close(losses[name], changed_losses[name])
 
         observation_states = _compute_observation_states(
@@ -539,8 +693,8 @@ class LatentStateTest(unittest.TestCase):
         for original_gradient, changed_gradient in zip(original_gradients, changed_gradients):
             torch.testing.assert_close(original_gradient, changed_gradient)
 
-    def test_short_trajectory_has_reconstruction_but_no_forecast_loss(self):
-        """A single observation cannot seed a forecast after the warm-up."""
+    def test_single_frame_trajectory_has_no_transition_or_forecast_loss(self):
+        """A single observation has no displacement target or forecast."""
         model = LatentStateModel(
             latent_size=4,
         )
@@ -552,7 +706,7 @@ class LatentStateTest(unittest.TestCase):
             compute_penetration_loss=False,
         )
         self.assertEqual(losses["observed_frame_count"], 1)
-        self.assertEqual(losses["reconstruction_element_count"], 3)
+        self.assertEqual(losses["reconstruction_element_count"], 0)
         self.assertTrue(torch.isfinite(losses["reconstruction_loss"]))
         self.assertEqual(losses["position_element_count"], 0)
         self.assertEqual(losses["consistency_element_count"], 0)

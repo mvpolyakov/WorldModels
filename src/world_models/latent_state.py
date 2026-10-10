@@ -7,6 +7,29 @@ from sim.scene_features import (
     unpack_surface_features,
 )
 
+DYNAMICS_OUTPUT_WEIGHT_GAIN = .1 # initial guess: .01
+DECODER_OUTPUT_WEIGHT_GAIN = .95 # initial guess: .1
+
+
+def _initialize_mlp(
+    layers: list[nn.Module],
+    final_weight_gain: float | None,
+) -> None:
+    """Zero linear biases and optionally reduce the output-layer weight scale.
+
+    @param layers: Ordered modules that will form an MLP.
+    @param final_weight_gain: Xavier gain for the last Linear layer, or None to
+        retain its default weight initialization.
+    """
+    linear_layers = [layer for layer in layers if isinstance(layer, nn.Linear)]
+    for layer in linear_layers:
+        nn.init.zeros_(layer.bias)
+    if final_weight_gain is not None:
+        nn.init.xavier_uniform_(
+            linear_layers[-1].weight,
+            gain=final_weight_gain,
+        )
+
 
 def _build_mlp(
     input_size: int,
@@ -14,6 +37,7 @@ def _build_mlp(
     hidden_size: int,
     *,
     layer_norm_enabled: bool,
+    final_weight_gain: float | None,
 ) -> nn.Sequential:
     """Build an MLP with two optionally normalized hidden layers.
 
@@ -21,6 +45,7 @@ def _build_mlp(
     @param output_size: Number of output values per sample.
     @param hidden_size: Width of both hidden layers.
     @param layer_norm_enabled: Whether to normalize each hidden linear output.
+    @param final_weight_gain: Optional Xavier gain for the output weights.
 
     @return: Sequential linear network mapping input_size to output_size.
     """
@@ -31,6 +56,7 @@ def _build_mlp(
     if layer_norm_enabled:
         layers.append(nn.LayerNorm(hidden_size))
     layers.extend((nn.ReLU(), nn.Linear(hidden_size, output_size)))
+    _initialize_mlp(layers, final_weight_gain)
     return nn.Sequential(*layers)
 
 
@@ -39,12 +65,14 @@ def _build_mlp2(
     output_size: int,
     *,
     layer_norm_enabled: bool,
+    final_weight_gain: float,
 ) -> nn.Sequential:
     """Build the dynamics MLP with three optionally normalized hidden layers.
 
     @param input_size: Number of input values per sample.
     @param output_size: Number of output values per sample.
     @param layer_norm_enabled: Whether to normalize each hidden linear output.
+    @param final_weight_gain: Xavier gain for the dynamics output weights.
 
     @return: Sequential linear network mapping input_size to output_size.
     """
@@ -59,6 +87,7 @@ def _build_mlp2(
         layers.append(nn.ReLU())
         hidden_input_size = hidden_size
     layers.append(nn.Linear(hidden_size, output_size))
+    _initialize_mlp(layers, final_weight_gain)
     return nn.Sequential(*layers)
 
 
@@ -140,6 +169,8 @@ class LatentStateModel(nn.Module):
     @param hidden_size: Width of the state-update and decoder hidden layers.
     @param warm_up_length: Number of observed frames before autonomous prediction.
     @param layer_norm_enabled: Whether hidden MLP layers use LayerNorm.
+    @param dynamics_output_weight_gain: Initial Xavier gain for the residual output.
+    @param decoder_output_weight_gain: Initial Xavier gain for displacement output.
     """
 
     def __init__(
@@ -149,6 +180,8 @@ class LatentStateModel(nn.Module):
         warm_up_length: int = 5,
         *,
         layer_norm_enabled: bool = True,
+        dynamics_output_weight_gain: float = DYNAMICS_OUTPUT_WEIGHT_GAIN,
+        decoder_output_weight_gain: float = DECODER_OUTPUT_WEIGHT_GAIN,
     ):
         """Configure observation preparation, update, transition, and decoding."""
         super().__init__()
@@ -161,6 +194,8 @@ class LatentStateModel(nn.Module):
         self.hidden_size = hidden_size
         self.warm_up_length = warm_up_length
         self.layer_norm_enabled = layer_norm_enabled
+        self.dynamics_output_weight_gain = dynamics_output_weight_gain
+        self.decoder_output_weight_gain = decoder_output_weight_gain
 
         # Component models
         self.observation_encoder = ObservationEncoder()
@@ -171,18 +206,21 @@ class LatentStateModel(nn.Module):
             latent_size,
             hidden_size,
             layer_norm_enabled=layer_norm_enabled,
+            final_weight_gain=None,
         )
         self.dynamics_model = _build_mlp2(
             latent_size,
             latent_size,
             layer_norm_enabled=layer_norm_enabled,
+            final_weight_gain=dynamics_output_weight_gain,
         )
 
         self.latent_state_decoder = _build_mlp(
             latent_size,
             3,
             hidden_size,
-            layer_norm_enabled=layer_norm_enabled,
+            layer_norm_enabled=False,
+            final_weight_gain=decoder_output_weight_gain,
         )
 
     def get_required_history(self) -> int:

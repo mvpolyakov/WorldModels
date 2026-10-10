@@ -67,11 +67,17 @@ def _load_checkpoint_model(checkpoint, device):
             ),
         )
     elif checkpoint.get("model_type") == "LatentStateModel":
+        initialization_gains = {
+            name: checkpoint[name]
+            for name in ("dynamics_output_weight_gain", "decoder_output_weight_gain")
+            if name in checkpoint
+        }
         model = LatentStateModel(
             latent_size=checkpoint["latent_size"],
             hidden_size=checkpoint["hidden_size"],
             warm_up_length=checkpoint["warm_up_length"],
             layer_norm_enabled=checkpoint.get("layer_norm_enabled", False),
+            **initialization_gains,
         )
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device)
