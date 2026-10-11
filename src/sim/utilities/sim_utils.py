@@ -200,6 +200,31 @@ class DisplacementErrorTracker:
         return self._total_step_error
 
 
+class PositionMSETracker:
+    """Track XYZ position MSE for each prediction step."""
+
+    def __init__(self):
+        self.values = []
+
+    def update(
+        self,
+        actual_positions: np.ndarray,
+        predicted_positions: np.ndarray,
+    ) -> float:
+        """Record and return XYZ position mean squared error for one step.
+
+        Both position arrays have shape (B, K, 3): B environments, K
+        mobiles, and XYZ coordinates.
+        """
+        if actual_positions.shape != predicted_positions.shape:
+            raise ValueError("Actual and predicted position shapes must match.")
+
+        squared_position_error = (actual_positions - predicted_positions) ** 2
+        mse = float(np.mean(squared_position_error))
+        self.values.append(mse)
+        return mse
+
+
 class TrajectoryRecorder:
     """Capture translucent snapshots for actual, observed, and predicted mobiles."""
 

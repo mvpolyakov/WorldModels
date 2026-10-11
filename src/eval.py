@@ -15,12 +15,14 @@ from sim.scene_features import (
 )
 from sim.utilities.sim_utils import (
     DisplacementErrorTracker,
+    PositionMSETracker,
     PredictionWorld,
     TrajectoryRecorder,
 )
 from sim.utilities.viz_utils import (
     draw_ground_coordinate_lines,
     save_displacement_error_chart,
+    save_position_mse_chart,
 )
 from world_models import (
     DummyWorldModel,
@@ -243,9 +245,9 @@ def _replay_prediction(
     @param prediction_count: Maximum autonomous steps after warm-up.
     @param ghost_interval: Frame spacing for trajectory snapshots.
 
-    @return: Replay results containing cumulative XYZ displacement errors,
-        prediction and segment counts, transfer timing records, and any stop
-        frame and reason.
+    @return: Replay results containing cumulative XYZ displacement error and
+        per-step XYZ position MSE values; prediction and segment counts; transfer
+        timing records; and any stop frame and reason.
     """
 
     actual_positions = recording["actual_positions"]
@@ -263,6 +265,7 @@ def _replay_prediction(
         scene_features,
     )
     displacement_error = DisplacementErrorTracker()
+    position_mse = PositionMSETracker()
     trajectory_recorder.set_up_predictions(predicted_world.mobile_positions)
     trajectory_recorder.capture_observation(actual_positions[0])
     final_actual_frame = len(actual_positions) - 1
@@ -315,6 +318,10 @@ def _replay_prediction(
             actual_frame_positions,
             predicted_world.mobile_positions,
         )
+        position_mse.update(
+            actual_frame_positions,
+            predicted_world.mobile_positions,
+        )
         prediction_count_completed += 1
         if frame_index % ghost_interval == 0:
             trajectory_recorder.capture()
@@ -363,6 +370,7 @@ def _replay_prediction(
 
     return {
         "error_values": displacement_error.values,
+        "mse_values": position_mse.values,
         "prediction_count": prediction_count_completed,
         "segment_count": segment_count,
         "transfer_events": transfer_events,
@@ -486,6 +494,7 @@ def get_args():
     parser.add_argument("--ghost-interval", type=int, default=10)
     parser.add_argument("--output-image", type=str, default="artifacts/ball_path.png")
     parser.add_argument("--output-error-chart", type=str, default="artifacts/displacement_error.png")
+    parser.add_argument("--output-mse-chart", type=str, default="artifacts/position_mse.png")
 
     parser.add_argument("--world", type=str, default="opposing-ramps")
     parser.add_argument("--randomize-scene", action="store_true")
@@ -608,6 +617,7 @@ def main() -> None:
 #        time.sleep(0.1)
 
     error_values = replay_result["error_values"]
+    mse_values = replay_result["mse_values"]
     if error_values:
         print(
             f"Final cumulative XYZ displacement error after "
@@ -615,6 +625,8 @@ def main() -> None:
         )
     else:
         print("No prediction frames were available after warm-up.")
+    if len(mse_values) >= 10:
+        print(f"XYZ position MSE at prediction step 10: {mse_values[9]:.6f}")
     if replay_result["stop_reason"] is not None:
         print(
             f"Prediction rollout stopped at actual frame "
@@ -638,6 +650,12 @@ def main() -> None:
         args.output_error_chart,
     )
     print(f"Saved displacement error chart to {os.path.abspath(error_chart_path)}")
+
+    mse_chart_path = save_position_mse_chart(
+        mse_values,
+        args.output_mse_chart,
+    )
+    print(f"Saved position MSE chart to {os.path.abspath(mse_chart_path)}")
 
     output_path = trajectory_recorder.save_image(
         args.output_image,

@@ -35,7 +35,7 @@ def draw_ground_coordinate_lines(scene, scene_config: SceneConfig) -> None:
 
 
 def save_displacement_error_chart(error_values, path):
-    """Save cumulative summed XY displacement error as a PNG line chart."""
+    """Save cumulative summed XYZ displacement error as a PNG line chart."""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -44,8 +44,34 @@ def save_displacement_error_chart(error_values, path):
     axes = figure.subplots()
     axes.plot(range(1, len(error_values) + 1), error_values)
     axes.set_xlabel("Simulation step")
-    axes.set_ylabel("Cumulative XY displacement error (distance × steps)")
-    axes.set_title("Cumulative XY Displacement Error")
+    axes.set_ylabel("Cumulative XYZ displacement error (distance × steps)")
+    axes.set_title("Cumulative XYZ Displacement Error")
+    axes.grid(alpha=0.3)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=150)
+
+    return output_path
+
+
+def save_position_mse_chart(mse_values, path):
+    """Save per-step XYZ position MSE and annotate prediction step ten."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    figure = Figure(figsize=(8, 5))
+    FigureCanvasAgg(figure)
+    axes = figure.subplots()
+    axes.plot(range(1, len(mse_values) + 1), mse_values)
+    if len(mse_values) >= 10:
+        axes.annotate(
+            f"Step 10 MSE: {mse_values[9]:.6f}",
+            xy=(10, mse_values[9]),
+            xytext=(8, 8),
+            textcoords="offset points",
+        )
+    axes.set_xlabel("Prediction step")
+    axes.set_ylabel("XYZ position MSE")
+    axes.set_title("XYZ Position MSE by Prediction Step")
     axes.grid(alpha=0.3)
     figure.tight_layout()
     figure.savefig(output_path, dpi=150)

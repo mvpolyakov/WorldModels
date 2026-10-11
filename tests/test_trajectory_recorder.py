@@ -18,6 +18,7 @@ from eval import (
 from sim.build_world import SimpleRollingWorldBuilder
 from sim.utilities.sim_utils import (
     DisplacementErrorTracker,
+    PositionMSETracker,
     PredictionWorld,
     TrajectoryRecorder,
 )
@@ -345,6 +346,7 @@ class PredictionWorldTest(unittest.TestCase):
 
         self.assertEqual(result["prediction_count"], 2)
         np.testing.assert_allclose(result["error_values"], 0.0)
+        np.testing.assert_allclose(result["mse_values"], 0.0)
         self.assertEqual(mobile.set_pos.call_count, 21)
         self.assertEqual(world.scene.visualizer.update.call_count, 21)
         trajectory_recorder.set_up_predictions.assert_called_once()
@@ -465,6 +467,18 @@ class PredictionWorldTest(unittest.TestCase):
         )
 
         self.assertEqual(error, 3.0)
+
+    def test_position_mse_tracks_each_prediction_step(self):
+        tracker = PositionMSETracker()
+
+        for prediction_step in range(1, 11):
+            tracker.update(
+                np.zeros((1, 1, 3)),
+                np.full((1, 1, 3), prediction_step, dtype=float),
+        )
+
+        self.assertEqual(len(tracker.values), 10)
+        self.assertEqual(tracker.values[9], 100.0)
 
     def test_surface_transfer_handler_does_nothing_without_a_transfer(self):
         recording = {

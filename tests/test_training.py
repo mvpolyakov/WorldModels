@@ -52,7 +52,9 @@ class RecordingPositionModel(nn.Module):
 class TrainingTest(unittest.TestCase):
     def test_sequence_collection_requests_packed_surface_features(self):
         positions = torch.zeros((2, 3))
+        scene = SimpleNamespace(destroy=Mock())
         world = SimpleNamespace(
+            scene=scene,
             mobiles={"ball": SimpleNamespace(get_pos=lambda: positions)},
             scene_features=np.full((2, 10), -1.0, dtype=np.float32),
             step=lambda: None,
@@ -74,6 +76,7 @@ class TrainingTest(unittest.TestCase):
         )
 
         world_builder.get_surface_features.assert_called_once_with(world)
+        scene.destroy.assert_called_once_with()
         np.testing.assert_array_equal(collected_features, packed_surface_features)
 
     def test_position_history_model_predict_integrates_displacement(self):
@@ -124,7 +127,9 @@ class TrainingTest(unittest.TestCase):
         position_index = 0
 
         ball = SimpleNamespace(get_pos=lambda: positions[position_index])
+        scene = SimpleNamespace(destroy=Mock())
         world = SimpleNamespace(
+            scene=scene,
             mobiles={"ball": ball},
             scene_features=np.zeros((2, 10)),
         )
@@ -150,6 +155,7 @@ class TrainingTest(unittest.TestCase):
 
         self.assertEqual(len(trajectories[0]), 6)
         self.assertEqual(len(trajectories[1]), 8)
+        scene.destroy.assert_called_once_with()
 
     def test_create_trajectory_dataset_rounds_up_and_splits_complete_scenes(self):
         trajectories = [

@@ -42,11 +42,68 @@ def _compute_initialization_gains_for_model(
     rollout_drift_budget: float = 0.1,
     decoder_target_ratio: float = 1.0,
 ) -> dict[str, float]:
-    """Measure suggested output gains for one fresh model initialization.
+    """Estimate output-layer gains for one untrained model initialization.
 
-    Operates on a copy; weights and observation history are untouched. Use an
-    untrained model with zero output biases. Calibration holds sampled
-    observation-updated states fixed while rescaling the final weights.
+     At a high level, this function chooses initialization gains by matching each randomly
+    initialized output branch to a scale relevant to its role. The dynamics output
+    is compared with the latent state that it changes. The decoder output is
+    compared with observed position changes. For each branch, the function measures
+    the **output RMS produced by its current gain** and defines a **target RMS** from the
+    corresponding target (latent-state or position-change scale). It adjusts the gain by
+    the ratio of target RMS to measured RMS so a new initialization produces
+    outputs in the intended range. This controls whether initial outputs are
+    negligible or overwhelming; it does not train the model or test whether an
+    output points in the correct direction.
+
+    A gain scales the Xavier initialization of a branch's final weight matrix.
+    With upstream activations held fixed and final bias equal to zero, multiplying
+    those weights by a factor multiplies the branch output by the same factor.
+    Each suggested gain therefore follows the same rule:
+
+    ``suggested gain = current gain * target output RMS / measured output RMS``
+
+    The function obtains the measurement samples by running the observations
+    through the updater. It collects every non-padding latent state after warm-up
+    and the actual position change following each state. RMS always means one
+    statistic over the complete relevant tensor: square every value, average over
+    all sampled states and all coordinates, then take the square root.
+
+    For dynamics, ``predict_state(state)`` equals
+    ``state + dynamics_model(state)``. Each row returned by ``dynamics_model`` is
+    the proposed change to one sampled latent state and is called a residual. The
+    residual RMS is calculated over the entire group of residual rows and latent
+    coordinates.
+
+    ``rollout_drift_budget`` defines the largest allowed relative change in the
+    group of latent states during an unobserved rollout. At each rollout step, the
+    function computes the RMS difference between the current and starting latent
+    states, divides it by the starting latent-state RMS, and takes the maximum over
+    all steps through ``prediction_horizon``. A budget of 0.1 therefore permits at
+    most 10% relative RMS drift anywhere in the rollout.
+
+    Before performing that rollout, the function needs a target for the group of
+    one-step residuals. As a conservative approximation, it assumes residuals at
+    all steps could point in the same direction and add linearly. Under that
+    assumption, ``prediction_horizon`` residuals of size ``budget / horizon``
+    produce total drift equal to the budget. The target residual RMS is therefore:
+
+    ``rollout_drift_budget / prediction_horizon * latent-state RMS``
+
+    Nonlinear dynamics and changing residual directions can make the actual
+    rollout differ from this approximation. The function consequently performs
+    the repeated rollout after rescaling and halves the gain until the measured
+    relative drift fits the budget.
+
+    For the decoder, the target RMS is ``decoder_target_ratio`` times the RMS of
+    the observed position changes. The decoder is measured on one-step predicted
+    states, and the same target/measured rule gives its suggested gain.
+
+    The diagnostic ratios describe these output magnitudes before and after
+    correction. They do not describe prediction error.
+
+    Calibration holds the sampled observation-updated
+    states fixed while rescaling the copied model's final weights. Use a fresh,
+    untrained model with zero output biases.
 
     B is trajectory count, T is padded frame count, F is scene-feature width.
     Inputs must use the model's device and floating dtype; padding is trailing.
@@ -55,9 +112,8 @@ def _compute_initialization_gains_for_model(
     @param scene_features: Static scene features (B, F).
     @param padding_frame_mask: Boolean (B, T); True excludes a padded frame.
     @param prediction_horizon: Number of repeated dynamics steps to check.
-    @param rollout_drift_budget: Maximum RMS latent change / starting RMS across
-        the rollout. The initial per-step target is this budget divided by horizon,
-        since shared dynamics updates can accumulate coherently.
+    @param rollout_drift_budget: Maximum, over all rollout steps, of latent change
+        RMS divided by starting latent-state RMS.
     @param decoder_target_ratio: Desired decoded RMS / observed displacement RMS.
 
     @return: Suggested constructor gains and measured RMS/ratio diagnostics before

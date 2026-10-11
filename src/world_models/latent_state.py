@@ -7,8 +7,8 @@ from sim.scene_features import (
     unpack_surface_features,
 )
 
-DYNAMICS_OUTPUT_WEIGHT_GAIN = .1 # initial guess: .01
-DECODER_OUTPUT_WEIGHT_GAIN = .95 # initial guess: .1
+DYNAMICS_OUTPUT_WEIGHT_GAIN = .01
+DECODER_OUTPUT_WEIGHT_GAIN = .1 
 
 
 def _initialize_mlp(
