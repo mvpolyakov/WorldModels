@@ -15,22 +15,18 @@ TRAJECTORIES_PER_SCENE = 4
 
 def _round_up_trajectory_count(n_trajectories: int) -> int:
     """Round a requested trajectory count up to a complete scene group."""
-    if n_trajectories < 2:
-        raise ValueError(
-            "At least 2 trajectories are required for training and validation."
-        )
-    return (
-        (n_trajectories + TRAJECTORIES_PER_SCENE - 1)
-        // TRAJECTORIES_PER_SCENE
-        * TRAJECTORIES_PER_SCENE
-    )
+
+    # round up to a multiple of TRAJECTORIES_PER_SCENE * 6 (5 training per 1 validation hardcoded below)
+    return (n_trajectories // (6 * TRAJECTORIES_PER_SCENE) + 1) * 6 * TRAJECTORIES_PER_SCENE
 
 
 def _get_training_trajectory_count(n_trajectories: int) -> int:
     """Choose a split boundary that keeps scene groups intact when possible."""
     scene_count = n_trajectories // TRAJECTORIES_PER_SCENE
+
     if scene_count == 1:
         return n_trajectories - 1
+    
     validation_scene_count = max(1, scene_count // 5)
     return (scene_count - validation_scene_count) * TRAJECTORIES_PER_SCENE
 
@@ -516,23 +512,40 @@ def create_trajectory_sequence_dataset(
     n_trajectories = _round_up_trajectory_count(n_trajectories)
 
     random_generator = np.random.default_rng(None if seed == 0 else seed)
-    trajectories, scene_features = SimulationTrajectoryCollector(
+
+    training_trajectory_count = _get_training_trajectory_count(n_trajectories)
+
+    training_trajectories, training_scene_features = SimulationTrajectoryCollector(
         world_builder
     ).collect_randomized_batch(
         steps,
-        n_environments=n_trajectories,
+        n_environments=training_trajectory_count,
         random_generator=random_generator,
         trajectories_per_scene=TRAJECTORIES_PER_SCENE,
         use_surface_features=True,
     )
-    training_trajectory_count = _get_training_trajectory_count(n_trajectories)
 
     training_dataset = TrajectorySequenceDataset(
-        trajectories[:training_trajectory_count],
-        scene_features[:training_trajectory_count],
+        training_trajectories,
+        training_scene_features,
     )
+
+    validation_trajectories, validation_scene_features = SimulationTrajectoryCollector(
+        world_builder
+    ).collect_randomized_batch(
+        steps,
+        n_environments=n_trajectories - training_trajectory_count,
+        random_generator=random_generator,
+        trajectories_per_scene=TRAJECTORIES_PER_SCENE,
+        use_surface_features=True,
+    )
+
     validation_dataset = TrajectorySequenceDataset(
-        trajectories[training_trajectory_count:],
-        scene_features[training_trajectory_count:],
+        validation_trajectories,
+        validation_scene_features,
     )
-    return trajectories, training_dataset, validation_dataset
+
+    print('\ntrajectories used:', len(training_trajectories), '/', len(validation_trajectories))
+
+    # trajectories themselves are only returned here for saving/logging
+    return training_trajectories + validation_trajectories, training_dataset, validation_dataset
