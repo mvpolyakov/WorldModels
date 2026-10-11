@@ -31,14 +31,9 @@ class PredictionWorld:
         self._uses_recurrent_state = isinstance(model, LatentStateModel)
         
         if self._uses_recurrent_state:
-            # Generate the first latent state by doing the first encoding step (but no prediction)
-
-            self._observed_frame_count = 1
-
             # Indicates the stored latent represents a prediction for the current frame that hasn’t yet incorporated that frame’s observation.
             # After step(): True—the model has advanced to the next frame by prediction.
             # After observe(): False—the state incorporates the observation.
-            self._state_needs_observation_update = False
             batch_size, mobile_count = self.mobile_positions.shape[:2]
             device = next(model.parameters()).device
 
@@ -53,25 +48,7 @@ class PredictionWorld:
                 mobile_count,
                 -1,
             ).reshape(batch_size * mobile_count, -1)
-            
-            positions = torch.as_tensor(
-                self.mobile_positions,
-                dtype=torch.float32,
-                device=device,
-            ).reshape(batch_size * mobile_count, 3)
-
-            with torch.inference_mode():
-                initial_state = model.initialize_state(
-                    batch_size * mobile_count,
-                    device=device,
-                    dtype=positions.dtype,
-                )
-                self.latent_state = model.encode_predict_update_helper(
-                    initial_state,
-                    positions,
-                    self._raw_scene_features,
-                    advance=False,
-                )
+            self.reset_to_observation(initial_mobile_positions)
 
     def needs_more_warm_up(self):
         """Return whether the model still needs observed history."""
@@ -106,6 +83,49 @@ class PredictionWorld:
                 )
             self._observed_frame_count += 1
             self._state_needs_observation_update = False
+
+    def reset_to_observation(self, observation_frame):
+        """Discard recurrent history if any and initialize from one observed frame.
+
+        Preserve the mobile_positions array so the trajectory recorder retains
+        its reference. Later warm-up frames use the regular observe method.
+
+        @param observation_frame: Array shaped (B, K, 3), containing one
+            observed frame for B environments and K mobiles.
+        """
+        if not self._uses_recurrent_state:
+            raise TypeError("Observation restarts require a latent-state model.")
+
+        observed_position = np.asarray(observation_frame, dtype=float)
+        if observed_position.shape != self.mobile_positions.shape:
+            raise ValueError(
+                "observed_mobile_positions must have shape "
+                f"{self.mobile_positions.shape}"
+            )
+
+        batch_size, mobile_count = self.mobile_positions.shape[:2]
+        device = next(self.model.parameters()).device
+        positions = torch.as_tensor(
+            observed_position,
+            dtype=torch.float32,
+            device=device,
+        ).reshape(batch_size * mobile_count, 3)
+        with torch.inference_mode():
+            initial_state = self.model.initialize_state(
+                batch_size * mobile_count,
+                device=positions.device,
+                dtype=positions.dtype,
+            )
+            self.latent_state = self.model.encode_predict_update_helper(
+                initial_state,
+                positions,
+                self._raw_scene_features,
+                advance=False,
+            )
+        self.mobile_positions[...] = observed_position
+        self.position_history = observed_position[:, :, None, :].copy()
+        self._observed_frame_count = 1
+        self._state_needs_observation_update = False
 
     def step(self):
         """Advance each predicted mobile by one model step.
@@ -149,7 +169,7 @@ class PredictionWorld:
 
 
 class DisplacementErrorTracker:
-    """Track summed displacement error across simulation steps."""
+    """Track cumulative XYZ displacement error across prediction steps."""
 
     def __init__(self):
         self.values = []
@@ -171,7 +191,7 @@ class DisplacementErrorTracker:
         if actual_positions.shape != predicted_positions.shape:
             raise ValueError("Actual and predicted position shapes must match.")
 
-        displacement = actual_positions[..., :2] - predicted_positions[..., :2]
+        displacement = actual_positions - predicted_positions
         mobile_errors = np.linalg.norm(displacement, axis=-1).mean(axis=0)
 
         step_error = float(np.mean(mobile_errors))

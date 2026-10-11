@@ -410,6 +410,29 @@ class LatentStateTest(unittest.TestCase):
 
         self.assertEqual(predicted_world.latent_state.item(), 26.0)
 
+    def test_prediction_world_restart_discards_the_previous_latent(self):
+        predicted_world = PredictionWorld(
+            np.ones((1, 1, 3), dtype=np.float32),
+            FrameCountingLatentModel(),
+            _surface_features(1),
+        )
+        predicted_world.observe(np.full((1, 1, 3), 2.0, dtype=np.float32))
+        predicted_world.step()
+
+        restart_observations = np.asarray(
+            [
+                [[[4.0, 4.0, 4.0]]],
+                [[[5.0, 5.0, 5.0]]],
+            ],
+            dtype=np.float32,
+        )
+        predicted_world.reset_to_observation(restart_observations[0])
+        predicted_world.observe(restart_observations[1])
+
+        self.assertEqual(predicted_world.latent_state.item(), 19.0)
+        np.testing.assert_allclose(predicted_world.mobile_positions, 5.0)
+        self.assertFalse(predicted_world.needs_more_warm_up())
+
     def test_prediction_branches_do_not_mutate_the_starting_state(self):
         model = LatentStateModel(
             latent_size=4,
