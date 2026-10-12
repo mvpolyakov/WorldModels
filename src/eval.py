@@ -21,7 +21,9 @@ from sim.utilities.sim_utils import (
 )
 from sim.utilities.viz_utils import (
     draw_ground_coordinate_lines,
+    save_acceleration_chart,
     save_displacement_error_chart,
+    save_latent_state_chart,
     save_position_mse_chart,
 )
 from world_models import (
@@ -224,6 +226,38 @@ def _collect_surface_episode_metadata(
     }
 
 
+def _record_replay_diagnostics(
+    replay_diagnostics: dict,
+    actual_frame_index: int,
+    predicted_world: PredictionWorld,
+) -> None:
+    """Record predicted acceleration and recurrent state at one actual frame.
+
+    Acceleration requires three consecutive positions in the current prediction
+    segment, so its first two frames remain NaN after initialization or a reset.
+
+    @param replay_diagnostics: Acceleration and latent arrays indexed by actual frame.
+    @param actual_frame_index: Frame receiving the current prediction state.
+    @param predicted_world: Prediction state after observing or predicting that frame.
+    """
+    if predicted_world.position_history.shape[2] >= 3:
+        recent_positions = predicted_world.position_history[:, :, -3:, :]
+        acceleration_vectors = (
+            recent_positions[:, :, 2]
+            - 2 * recent_positions[:, :, 1]
+            + recent_positions[:, :, 0]
+        )
+        replay_diagnostics["predicted_acceleration_values"][actual_frame_index] = (
+            np.linalg.norm(acceleration_vectors, axis=-1).mean()
+        )
+
+    latent_state_values = replay_diagnostics["latent_state_values"]
+    if latent_state_values is not None:
+        latent_state_values[actual_frame_index] = (
+            predicted_world.latent_state[0].detach().cpu().numpy()
+        )
+
+
 def _replay_prediction(
     world: World,
     trajectory_recorder: TrajectoryRecorder,
@@ -245,9 +279,9 @@ def _replay_prediction(
     @param prediction_count: Maximum autonomous steps after warm-up.
     @param ghost_interval: Frame spacing for trajectory snapshots.
 
-    @return: Replay results containing cumulative XYZ displacement error and
-        per-step XYZ position MSE values; prediction and segment counts; transfer
-        timing records; and any stop frame and reason.
+    @return: Replay results containing error values, actual and predicted
+        acceleration magnitudes by actual frame, latent states by actual frame
+        for recurrent models, transfer records, and replay completion details.
     """
 
     actual_positions = recording["actual_positions"]
@@ -275,6 +309,23 @@ def _replay_prediction(
     stop_frame = None
     transfer_events = []
     segment_count = 1
+
+    actual_acceleration_values = np.full(len(actual_positions), np.nan)
+    actual_acceleration_vectors = np.diff(actual_positions, n=2, axis=0)
+    actual_acceleration_values[2:] = np.linalg.norm(
+        actual_acceleration_vectors,
+        axis=-1,
+    ).mean(axis=(1, 2))
+    replay_diagnostics = {
+        "predicted_acceleration_values": np.full(len(actual_positions), np.nan),
+        "latent_state_values": None,
+    }
+    if isinstance(model, LatentStateModel):
+        replay_diagnostics["latent_state_values"] = np.full(
+            (len(actual_positions), model.latent_size),
+            np.nan,
+        )
+    _record_replay_diagnostics(replay_diagnostics, 0, predicted_world)
 
     # skip any transitions that happen during the initial warmup period
     # this explicit handling is only needed at the beginning, not subsequent warmup periods
@@ -307,6 +358,11 @@ def _replay_prediction(
             predicted_world.needs_more_warm_up()
         ):
             predicted_world.observe(actual_frame_positions)
+            _record_replay_diagnostics(
+                replay_diagnostics,
+                frame_index,
+                predicted_world,
+            )
             if frame_index % ghost_interval == 0:
                 trajectory_recorder.capture_observation(actual_frame_positions)
             world.scene.visualizer.update(force=True)
@@ -314,6 +370,11 @@ def _replay_prediction(
             continue
 
         predicted_world.step()
+        _record_replay_diagnostics(
+            replay_diagnostics,
+            frame_index,
+            predicted_world,
+        )
         displacement_error.update(
             actual_frame_positions,
             predicted_world.mobile_positions,
@@ -336,6 +397,7 @@ def _replay_prediction(
                 trajectory_recorder,
                 recording,
                 surface_replay_state,
+                replay_diagnostics,
             )
             if surface_transfer_event is not None:
                 stop_reason = surface_transfer_event.get("stop_reason")
@@ -371,6 +433,11 @@ def _replay_prediction(
     return {
         "error_values": displacement_error.values,
         "mse_values": position_mse.values,
+        "actual_acceleration_values": actual_acceleration_values,
+        "predicted_acceleration_values": replay_diagnostics[
+            "predicted_acceleration_values"
+        ],
+        "latent_state_values": replay_diagnostics["latent_state_values"],
         "prediction_count": prediction_count_completed,
         "segment_count": segment_count,
         "transfer_events": transfer_events,
@@ -384,6 +451,7 @@ def _detect_and_handle_surface_transfer(
     trajectory_recorder: TrajectoryRecorder,
     recording: dict,
     replay_state: dict,
+    replay_diagnostics: dict | None = None,
 ) -> dict | None:
     """Detect one predicted transfer and apply its matched observation restart.
 
@@ -404,6 +472,8 @@ def _detect_and_handle_surface_transfer(
     @param recording: Actual positions, surface records, and transition metadata.
     @param replay_state: Mutable event state containing the preceding predicted
         surface and next chronological transition index.
+    @param replay_diagnostics: Optional acceleration and latent arrays indexed by
+        actual frame.
 
     @return: None when prediction remains on its current surface. Otherwise, an
         event containing either a new actual-frame anchor or a stop reason.
@@ -471,6 +541,13 @@ def _detect_and_handle_surface_transfer(
     for window_frame, observed_positions in enumerate(warmup_observation_window):
         if window_frame > 0:
             predicted_world.observe(observed_positions) # For warming up the model
+        if replay_diagnostics is not None:
+            actual_frame_index = transition["transition_frame"] + window_frame
+            _record_replay_diagnostics(
+                replay_diagnostics,
+                actual_frame_index,
+                predicted_world,
+            )
         for mobile_index, mobile in enumerate(
             trajectory_recorder.actual_mobiles.values()
         ):
@@ -495,6 +572,8 @@ def get_args():
     parser.add_argument("--output-image", type=str, default="artifacts/ball_path.png")
     parser.add_argument("--output-error-chart", type=str, default="artifacts/displacement_error.png")
     parser.add_argument("--output-mse-chart", type=str, default="artifacts/position_mse.png")
+    parser.add_argument("--output-acceleration-chart", type=str, default="artifacts/acceleration.png")
+    parser.add_argument("--output-latent-chart", type=str, default="artifacts/latent_state.png")
 
     parser.add_argument("--world", type=str, default="opposing-ramps")
     parser.add_argument("--randomize-scene", action="store_true")
@@ -656,6 +735,21 @@ def main() -> None:
         args.output_mse_chart,
     )
     print(f"Saved position MSE chart to {os.path.abspath(mse_chart_path)}")
+
+    acceleration_chart_path = save_acceleration_chart(
+        replay_result["actual_acceleration_values"],
+        replay_result["predicted_acceleration_values"],
+        args.output_acceleration_chart,
+    )
+    print(f"Saved acceleration chart to {os.path.abspath(acceleration_chart_path)}")
+
+    if replay_result["latent_state_values"] is not None:
+        latent_chart_path = save_latent_state_chart(
+            replay_result["latent_state_values"],
+            recording["actual_positions"][:, 0, 0, 2],
+            args.output_latent_chart,
+        )
+        print(f"Saved latent-state chart to {os.path.abspath(latent_chart_path)}")
 
     output_path = trajectory_recorder.save_image(
         args.output_image,

@@ -77,3 +77,48 @@ def save_position_mse_chart(mse_values, path):
     figure.savefig(output_path, dpi=150)
 
     return output_path
+
+
+def save_acceleration_chart(actual_accelerations, predicted_accelerations, path):
+    """Save actual and predicted acceleration magnitudes by actual frame."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    figure = Figure(figsize=(8, 5))
+    FigureCanvasAgg(figure)
+    axes = figure.subplots()
+    frame_indices = range(len(actual_accelerations))
+    axes.plot(frame_indices, actual_accelerations, label="Actual")
+    axes.plot(frame_indices, predicted_accelerations, label="Predicted")
+    axes.set_xlabel("Actual frame")
+    axes.set_ylabel("Acceleration magnitude (position units / frame²)")
+    axes.set_title("Actual and Predicted Acceleration")
+    axes.grid(alpha=0.3)
+    axes.legend()
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=150)
+
+    return output_path
+
+
+def save_latent_state_chart(latent_states, actual_z_coordinates, path):
+    """Save every latent variable with the actual ball height by actual frame."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    figure = Figure(figsize=(10, 6))
+    FigureCanvasAgg(figure)
+    axes = figure.subplots()
+    frame_indices = range(len(actual_z_coordinates))
+    for latent_index in range(latent_states.shape[1]):
+        axes.plot(frame_indices, latent_states[:, latent_index], label=f"Latent {latent_index}")
+    axes.plot(frame_indices, actual_z_coordinates, label="Actual z", color="black", linewidth=2)
+    axes.set_xlabel("Actual frame")
+    axes.set_ylabel("Value")
+    axes.set_title("Latent State and Actual Z Coordinate")
+    axes.grid(alpha=0.3)
+    axes.legend()
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=150)
+
+    return output_path

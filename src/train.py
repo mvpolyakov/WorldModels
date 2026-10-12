@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime
 import json
 import random
 from pathlib import Path
@@ -818,7 +819,7 @@ def train_model(
                 )
 
         if epoch % 2 == 0:
-            print("epoch", epoch)
+            print("epoch", epoch, datetime.now().strftime("%H:%M:%S"))
 
     batch_metrics = {
         "training": training_batch_metrics,
