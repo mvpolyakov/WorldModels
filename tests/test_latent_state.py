@@ -21,6 +21,7 @@ from sim.utilities.sim_utils import PredictionWorld
 from train import (
     _compute_batch_losses,
     _compute_observation_states,
+    _compute_surface_episode_indices,
     _compute_trajectory_baseline_losses,
     _roll_out_model,
     _store_validation_rollouts,
@@ -645,6 +646,63 @@ class LatentStateTest(unittest.TestCase):
             ],
         )
 
+    def test_surface_episodes_reset_observations_and_limit_forecasts(self):
+        scene_features = torch.tensor([[
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+            10.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+            0.2,
+        ]])
+        x_positions = torch.tensor([0.0] * 6 + [10.0] * 6 + [0.0] * 6)
+        observed_positions = torch.zeros((1, 18, 3))
+        observed_positions[0, :, 0] = x_positions
+        padding_frame_mask = torch.zeros((1, 18), dtype=torch.bool)
+        surface_episode_indices = _compute_surface_episode_indices(
+            observed_positions,
+            scene_features,
+            padding_frame_mask,
+        )
+
+        torch.testing.assert_close(
+            surface_episode_indices,
+            torch.tensor([[1] * 6 + [2] * 6 + [3] * 6]),
+        )
+
+        model = LatentStateModel(latent_size=4, hidden_size=8)
+        losses = _compute_batch_losses(
+            model,
+            observed_positions,
+            scene_features,
+            padding_frame_mask,
+            compute_penetration_loss=False,
+        )
+
+        self.assertEqual(losses["position_element_count"], 9)
+        self.assertEqual(losses["constant_position_loss"].item(), 0.0)
+        self.assertEqual(losses["constant_velocity_loss"].item(), 0.0)
+
+        changed_first_episode = observed_positions.clone()
+        changed_first_episode[0, :6, 1] = torch.arange(6)
+        changed_episode_indices = _compute_surface_episode_indices(
+            changed_first_episode,
+            scene_features,
+            padding_frame_mask,
+        )
+        original_states = _compute_observation_states(
+            model,
+            observed_positions,
+            scene_features,
+            padding_frame_mask,
+            surface_episode_indices,
+        )
+        changed_states = _compute_observation_states(
+            model,
+            changed_first_episode,
+            scene_features,
+            padding_frame_mask,
+            changed_episode_indices,
+        )
+        torch.testing.assert_close(original_states[:, 6:], changed_states[:, 6:])
+
     def test_padding_is_excluded_from_updates_and_losses(self):
         dataset = TrajectorySequenceDataset(
             [
@@ -702,7 +760,11 @@ class LatentStateTest(unittest.TestCase):
             torch.testing.assert_close(losses[name], changed_losses[name])
 
         observation_states = _compute_observation_states(
-            model, changed_padding, features, padding_frame_mask
+            model,
+            changed_padding,
+            features,
+            padding_frame_mask,
+            torch.ones_like(padding_frame_mask, dtype=torch.long),
         )
         torch.testing.assert_close(observation_states[0, 6], observation_states[0, 5])
         torch.testing.assert_close(observation_states[0, 7], observation_states[0, 5])

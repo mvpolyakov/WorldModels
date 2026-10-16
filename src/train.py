@@ -9,7 +9,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from sim.build_world import load_world_builder
-from sim.scene_features import SURFACE_FEATURE_SCHEMA
+from sim.scene_features import (
+    SURFACE_FEATURE_SCHEMA,
+    find_closest_surface,
+    unpack_surface_features,
+)
 from training.trajectories import (
     TrajectorySliceDataset,
     create_trajectory_sequence_dataset,
@@ -22,7 +26,50 @@ from world_models import LatentStateModel
 
 # Min 2 frames for change detection since includes the frame from which we predict; three for acceleration. Couple extra for init stabilization
 WARMUP_LENGTH = 5
-PREDICTION_HORIZON = 10
+PREDICTION_HORIZON = 50
+
+
+def _compute_surface_episode_indices(
+    observed_positions: torch.Tensor,
+    scene_features: torch.Tensor,
+    padding_frame_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Assign a new episode id whenever an observed trajectory changes surfaces.
+    This is needed for tracking when to reset latent state for observations (when
+    switching 'episodes')
+
+    B is trajectory count, T is padded frame count, and S is surface count.
+
+    @param observed_positions: XYZ observations shaped (B, T, 3).
+    @param scene_features: Packed surface records shaped (B, 6*S + 1).
+    @param padding_frame_mask: Boolean tensor shaped (B, T); True marks padding.
+
+    @return: Integer episode indices shaped (B, T). Indices increase at each
+        closest-surface change and remain unchanged through trailing padding.
+    """
+    batch_size, frame_count, _ = observed_positions.shape
+    surface_centers, surface_normals, _ = unpack_surface_features(scene_features)
+    surface_count = surface_centers.shape[1]
+    repeated_surface_centers = surface_centers.unsqueeze(1).expand(
+        batch_size, frame_count, surface_count, 3
+    ).reshape(batch_size * frame_count, surface_count, 3)
+    repeated_surface_normals = surface_normals.unsqueeze(1).expand(
+        batch_size, frame_count, surface_count, 3
+    ).reshape(batch_size * frame_count, surface_count, 3)
+    closest_surface_indices = find_closest_surface(
+        observed_positions.reshape(batch_size * frame_count, 3),
+        repeated_surface_centers,
+        repeated_surface_normals,
+    ).reshape(batch_size, frame_count)
+
+    surface_episode_starts = torch.zeros_like(padding_frame_mask)
+    surface_episode_starts[:, 0] = ~padding_frame_mask[:, 0]
+    surface_episode_starts[:, 1:] = (
+        ~padding_frame_mask[:, 1:]
+        & ~padding_frame_mask[:, :-1]
+        & (closest_surface_indices[:, 1:] != closest_surface_indices[:, :-1])
+    )
+    return torch.cumsum(surface_episode_starts, dim=1)
 
 
 def _compute_observation_states(
@@ -30,8 +77,9 @@ def _compute_observation_states(
     observed_positions: torch.Tensor,
     scene_features: torch.Tensor,
     padding_frame_mask: torch.Tensor,
+    surface_episode_indices: torch.Tensor,
 ) -> torch.Tensor:
-    """Traverse observations chronologically, retaining state across padded frames.
+    """Traverse observations, resetting state at each new surface episode.
 
     B is trajectory count, T is padded frame count, L is latent width, and F is
     scene-feature width. Gradients remain connected through the entire sequence.
@@ -39,6 +87,8 @@ def _compute_observation_states(
     @param observed_positions: XYZ observations (B, T, 3), with finite padding.
     @param scene_features: Static scene features (B, F).
     @param padding_frame_mask: Boolean tensor (B, T); True marks trailing padding.
+    @param surface_episode_indices: Integer tensor (B, T) identifying consecutive
+        observations on the same closest surface.
 
     @return: Observation-updated states (B, T, L). Padded entries repeat the
         trajectory's last observed state and are excluded from losses.
@@ -51,12 +101,26 @@ def _compute_observation_states(
     observation_states = []
     # step through each frame of the trajectories - whole batch at once - 
     for frame_index in range(observed_positions.shape[1]):
+        surface_episode_start_mask = (
+            ~padding_frame_mask[:, frame_index]
+            if frame_index == 0
+            else (
+                surface_episode_indices[:, frame_index]
+                != surface_episode_indices[:, frame_index - 1]
+            )
+        )
         # The first observation initializes state at its own time; later frames
         # require one transition before incorporating the new observation.
         prior_state = current_state if frame_index == 0 else model.predict_state(current_state)
-        
+        prior_state = torch.where(
+            surface_episode_start_mask.unsqueeze(-1),
+            torch.zeros_like(prior_state),
+            prior_state,
+        )
         observation_embedding = model.encode_observation(
-            observed_positions[:, frame_index], scene_features
+            observed_positions[:, frame_index],
+            scene_features,
+            observation_reset_mask=surface_episode_start_mask,
         )
         updated_state = model.update_state(prior_state, observation_embedding)
         current_state = torch.where(
@@ -71,7 +135,7 @@ def _compute_observation_states(
 def _compute_consistency_error_sum(
     predicted_states: torch.Tensor,
     observation_states: torch.Tensor,
-    padding_frame_mask: torch.Tensor,
+    excluded_row_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Score predicted latents against detached observation-informed targets.
 
@@ -80,13 +144,13 @@ def _compute_consistency_error_sum(
 
     @param predicted_states: Autonomous predictions (B, L).
     @param observation_states: Observation-updated targets at the same time (B, L).
-    @param padding_frame_mask: Boolean tensor (B,); True excludes a trajectory.
+    @param excluded_row_mask: Boolean tensor (B,); True excludes a trajectory.
 
-    @return: Scalar sum of squared latent errors over non-padding entries.
+    @return: Scalar sum of squared latent errors over included entries.
     """
     return torch.sum(
         (predicted_states - observation_states.detach()) ** 2
-        * (~padding_frame_mask).unsqueeze(-1)
+        * (~excluded_row_mask).unsqueeze(-1)
     )
 
 
@@ -95,7 +159,7 @@ def _compute_penetration_error_sum(
     predicted_positions: torch.Tensor,
     target_positions: torch.Tensor,
     scene_features: torch.Tensor,
-    padding_frame_mask: torch.Tensor,
+    excluded_row_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Penalize predictions below the target frame's selected surface.
 
@@ -107,9 +171,9 @@ def _compute_penetration_error_sum(
     @param predicted_positions: Predicted XYZ positions shaped (B, 3).
     @param target_positions: Actual target XYZ positions shaped (B, 3).
     @param scene_features: Packed surface records shaped (B, 6*S + 1).
-    @param padding_frame_mask: Boolean tensor shaped (B,); True excludes a row.
+    @param excluded_row_mask: Boolean tensor shaped (B,); True excludes a row.
 
-    @return: Scalar sum of squared excess penetration over non-padding rows.
+    @return: Scalar sum of squared excess penetration over included rows.
     """
     target_surface_context = model.observation_encoder.compute_closest_surface_context(
         target_positions,
@@ -130,7 +194,7 @@ def _compute_penetration_error_sum(
     excess_penetration = torch.relu(minimum_allowed_gap - predicted_surface_gap)
     return torch.sum(
         excess_penetration.square()
-        * (~padding_frame_mask).unsqueeze(-1)
+        * (~excluded_row_mask).unsqueeze(-1)
     )
 
 
@@ -140,6 +204,7 @@ def _compute_autonomous_rollout_error_sums(
     observed_positions: torch.Tensor,
     scene_features: torch.Tensor,
     padding_frame_mask: torch.Tensor,
+    surface_episode_indices: torch.Tensor,
     compute_penetration_loss: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Score all autonomous forecast starts in parallel at each forecast offset.
@@ -200,10 +265,13 @@ def _compute_autonomous_rollout_error_sums(
     @param observed_positions: Actual XYZ positions shaped (B, T, 3).
     @param scene_features: Static packed surface features shaped (B, F).
     @param padding_frame_mask: Boolean tensor shaped (B, T); True excludes a frame.
+    @param surface_episode_indices: Integer tensor (B, T) identifying consecutive
+        observations on the same closest surface.
     @param compute_penetration_loss: Whether to calculate penetration errors.
 
     @return: Position, penetration, and consistency error sums, followed by the
-        number of non-padding forecast frames scored across all starts and offsets.
+        number of eligible same-surface forecast frames scored across all starts
+        and offsets.
     """
     batch_size, padded_frame_count, _ = observed_positions.shape
     position_error_sum = observed_positions.new_zeros(())
@@ -223,6 +291,15 @@ def _compute_autonomous_rollout_error_sums(
     )
     predicted_states = observation_states[:, forecast_start_frames]
     predicted_positions = observed_positions[:, forecast_start_frames]
+    warm_up_start_frames = forecast_start_frames - WARMUP_LENGTH + 1
+    forecast_start_eligible_mask = (
+        ~padding_frame_mask[:, forecast_start_frames]
+        & ~padding_frame_mask[:, warm_up_start_frames]
+        & (
+            surface_episode_indices[:, forecast_start_frames]
+            == surface_episode_indices[:, warm_up_start_frames]
+        )
+    )
     maximum_forecast_offset = min(
         PREDICTION_HORIZON,
         forecast_start_count,
@@ -242,11 +319,17 @@ def _compute_autonomous_rollout_error_sums(
             + model.decode_state(predicted_states)
         )
         target_positions = observed_positions[:, target_frames]
-        forecast_padding_mask = (
+        forecast_surface_change_mask = (
+            surface_episode_indices[:, active_start_frames]
+            != surface_episode_indices[:, target_frames]
+        )
+        forecast_exclusion_mask = (
             padding_frame_mask[:, active_start_frames]
             | padding_frame_mask[:, target_frames]
+            | ~forecast_start_eligible_mask[:, :active_start_count]
+            | forecast_surface_change_mask
         )
-        scored_forecast_mask = (~forecast_padding_mask).unsqueeze(-1)
+        scored_forecast_mask = (~forecast_exclusion_mask).unsqueeze(-1)
 
         position_error_sum = position_error_sum + torch.sum(
             (predicted_positions - target_positions) ** 2
@@ -265,7 +348,7 @@ def _compute_autonomous_rollout_error_sums(
                     predicted_positions.reshape(flat_forecast_count, 3),
                     target_positions.reshape(flat_forecast_count, 3),
                     repeated_scene_features,
-                    forecast_padding_mask.reshape(flat_forecast_count),
+                    forecast_exclusion_mask.reshape(flat_forecast_count),
                 )
             )
         consistency_error_sum = (
@@ -273,7 +356,7 @@ def _compute_autonomous_rollout_error_sums(
             + _compute_consistency_error_sum(
                 predicted_states,
                 observation_states[:, target_frames],
-                forecast_padding_mask,
+                forecast_exclusion_mask,
             )
         )
         forecast_frame_count = forecast_frame_count + scored_forecast_mask.sum()
@@ -297,7 +380,8 @@ def _compute_batch_losses(
 
     B is trajectory count, T is padded frame count, L is latent width, and F is
     scene-feature width. Each forecast starts after WARMUP_LENGTH observations
-    and advances up to PREDICTION_HORIZON frames without observation updates.
+    on one surface and advances up to PREDICTION_HORIZON frames without
+    observation updates or crossing a surface transition.
 
     @param observed_positions: XYZ observations (B, T, 3), with finite padding.
     @param scene_features: Static scene features (B, F).
@@ -315,8 +399,17 @@ def _compute_batch_losses(
     # Observation branch first since the autonomous rollouts depend on it
     # prediction_horizon doesn't play a role here - observation updates computed once per frame
 
+    surface_episode_indices = _compute_surface_episode_indices(
+        observed_positions,
+        scene_features,
+        padding_frame_mask,
+    )
     observation_states = _compute_observation_states(
-        model, observed_positions, scene_features, padding_frame_mask
+        model,
+        observed_positions,
+        scene_features,
+        padding_frame_mask,
+        surface_episode_indices,
     )
     observed_frame_count = int((~padding_frame_mask).sum().item())
 
@@ -347,6 +440,7 @@ def _compute_batch_losses(
         observed_positions,
         scene_features,
         padding_frame_mask,
+        surface_episode_indices,
         compute_penetration_loss,
     )
     (
@@ -355,6 +449,7 @@ def _compute_batch_losses(
     ) = _compute_baseline_position_error_sums(
         observed_positions,
         padding_frame_mask,
+        surface_episode_indices,
         WARMUP_LENGTH,
         PREDICTION_HORIZON,
     )
@@ -768,7 +863,8 @@ def train_model(
     @return: Per-epoch training metrics, per-epoch validation metrics, final
         full-trajectory validation rollouts, and per-epoch batch diagnostics.
     """
-    optimizer = torch.optim.Adam(model.parameters(), config["lr"])
+    # even a very small decay (.001) wreaks havoc
+    optimizer = torch.optim.Adam(model.parameters(), config["lr"], weight_decay=0)  
     training_metrics = []
     validation_metrics = []
     training_batch_metrics = []
@@ -842,17 +938,18 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--slices-per-trajectory", type=int, default=4)
     parser.add_argument("--max-slice-length", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--hidden-size", type=int, default=16)  # not dynamics model
-    parser.add_argument("--latent-size", type=int, default=8) # width of latent state
+    parser.add_argument("--hidden-size", type=int, default=16)  # not dynamics model  best: 16
+    parser.add_argument("--latent-size", type=int, default=4) # width of latent state  best: 8 did fine too;   4 everywhere did very badly
+    # latent 4 while hidden are 16: ___
     parser.add_argument(
         "--layer-norm",
         action=argparse.BooleanOptionalAction,
         default=False,
     )
     parser.add_argument("--position-weight", type=float, default=1.0)
-    parser.add_argument("--penetration-weight", type=float, default=1.0)
-    parser.add_argument("--reconstruction-weight", type=float, default=1.0)
-    parser.add_argument("--consistency-weight", type=float, default=0.1)
+    parser.add_argument("--penetration-weight", type=float, default=.2)
+    parser.add_argument("--reconstruction-weight", type=float, default=1)
+    parser.add_argument("--consistency-weight", type=float, default=.1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--backend", choices=("cpu", "gpu"), default="gpu")
     parser.add_argument(
@@ -1033,6 +1130,23 @@ def main() -> None:
         "training_batches": batch_metrics["training"],
         "validation_batches": batch_metrics["validation"],
     }
+    np.set_printoptions(suppress=True)
+    def _round(x):
+        x = x.detach().cpu().numpy()
+        y = np.where(x < .00001, 0, x).round(4)
+        return y
+
+    try:
+        print('model weights')
+        print('dynamics model 0')
+        print(_round(model.dynamics_model[0]._parameters['weight']))
+        print('dynamics model 2')
+        print(_round(model.dynamics_model[3]._parameters['weight']))
+        print('state update 3')
+        print(_round(model.state_updater[3]._parameters['weight']))
+
+    except:
+        print(model)    
 
     output_dir = Path('artifacts/runs')
     output_dir.mkdir(parents=True, exist_ok=True)

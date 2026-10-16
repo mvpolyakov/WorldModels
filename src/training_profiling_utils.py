@@ -352,16 +352,19 @@ def _run_compute_init_gains() -> dict[str, object]:
 def _compute_baseline_position_error_sums(
     observed_positions: torch.Tensor,
     padding_frame_mask: torch.Tensor,
+    surface_episode_indices: torch.Tensor,
     warmup_length: int,
     prediction_horizon: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score constant-position and constant-velocity forecasts like the model.
 
-    Each baseline uses the same forecast starts, offsets, targets, and padding
-    exclusions as the model's position loss.
+    Each baseline uses the same forecast starts, offsets, targets, padding
+    exclusions, and surface-episode boundaries as the model's position loss.
 
     @param observed_positions: Actual XYZ positions shaped (B, T, 3).
     @param padding_frame_mask: Boolean tensor shaped (B, T); True excludes a frame.
+    @param surface_episode_indices: Integer tensor (B, T) identifying consecutive
+        observations on the same closest surface.
     @param warmup_length: Observed frame count before the first forecast.
     @param prediction_horizon: Maximum number of autonomous forecast steps.
 
@@ -376,6 +379,15 @@ def _compute_baseline_position_error_sums(
         warmup_length - 1 + forecast_start_count,
         device=observed_positions.device,
     )
+    warm_up_start_frames = forecast_start_frames - warmup_length + 1
+    forecast_start_eligible_mask = (
+        ~padding_frame_mask[:, forecast_start_frames]
+        & ~padding_frame_mask[:, warm_up_start_frames]
+        & (
+            surface_episode_indices[:, forecast_start_frames]
+            == surface_episode_indices[:, warm_up_start_frames]
+        )
+    )
     maximum_forecast_offset = min(prediction_horizon, forecast_start_count)
 
     for forecast_offset in range(1, maximum_forecast_offset + 1):
@@ -385,11 +397,17 @@ def _compute_baseline_position_error_sums(
         start_positions = observed_positions[:, active_start_frames]
         target_positions = observed_positions[:, target_frames]
         previous_positions = observed_positions[:, active_start_frames - 1]
-        forecast_padding_mask = (
+        forecast_surface_change_mask = (
+            surface_episode_indices[:, active_start_frames]
+            != surface_episode_indices[:, target_frames]
+        )
+        forecast_exclusion_mask = (
             padding_frame_mask[:, active_start_frames]
             | padding_frame_mask[:, target_frames]
+            | ~forecast_start_eligible_mask[:, :active_start_count]
+            | forecast_surface_change_mask
         )
-        scored_forecast_mask = (~forecast_padding_mask).unsqueeze(-1)
+        scored_forecast_mask = (~forecast_exclusion_mask).unsqueeze(-1)
 
         constant_position_error_sum = constant_position_error_sum + torch.sum(
             (start_positions - target_positions).square() * scored_forecast_mask

@@ -254,11 +254,14 @@ class LatentStateModel(nn.Module):
         self,
         position: torch.Tensor,
         scene_features: torch.Tensor,
+        observation_reset_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode an observed position and scene context for a state update.
 
         @param position: Float tensor with shape (B, 3), containing XYZ positions.
         @param scene_features: Packed top-plane records and radius, shape (B, F).
+        @param observation_reset_mask: Optional Boolean tensor shaped (B,); True
+            makes the current observation the first frame of a new episode.
 
         @return: Observation embedding with shape (B, E).
         """
@@ -266,6 +269,12 @@ class LatentStateModel(nn.Module):
 
         if self.previous_encoded_observation is None:
             self.previous_encoded_observation = encoded_observation
+        elif observation_reset_mask is not None:
+            self.previous_encoded_observation = torch.where(
+                observation_reset_mask.unsqueeze(-1),
+                encoded_observation,
+                self.previous_encoded_observation,
+            )
 
         encoded_difference = encoded_observation - \
                                 self.previous_encoded_observation
