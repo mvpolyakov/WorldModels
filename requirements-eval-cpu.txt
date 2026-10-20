@@ -1,0 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.8.0+cpu
+genesis-world[render]==1.3.3
+numpy==2.5.2
+Pillow>=10.0
+matplotlib>=3.11
