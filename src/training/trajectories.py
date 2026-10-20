@@ -245,11 +245,29 @@ class TrajectorySequenceDataset(Dataset):
 class TrajectorySliceDataset(Dataset):
     """Expose resampled fixed-width slices of complete source trajectories.
 
+    New scheme:
+    Collect complete trajectories, then train on slices beginning at different times. 
+    Reset the latent at each slice's start; do not process earlier observations 
+    or provide absolute frame indices.  Keep some slices starting at frame zero. 
+
+    An initial policy is four slices per trajectory per epoch: one beginning at zero 
+    and three at randomly chosen later frames. Use a maximum length of [128] frames and
+    retain three warm-up observations initially. Resample training starts each epoch.
+
+    Split source trajectories before sampling slices to prevent leakage. Fix validation 
+    starts for repeatable comparisons. Short slices remain usable for the targets 
+    they contain; exclude padding from state updates and losses. Within each slice, 
+    retain the current observation traversal and independent forecast branches after warm-up.
+
+    This removes a reliable clock measured from simulation start. The opposing-ramp task 
+    supplies the additional reason to distinguish different histories at similar positions.
+
     Each source trajectory contributes exactly one slice beginning at frame zero
     and the remaining slices begin at sampled later frames. Slice starts are
     local reset points: no preceding observation or absolute source-frame index
     is included. Samples are padded to ``max_slice_length``; a True entry in the
     padding mask marks a padded frame.
+
 
     @param source_dataset: Complete source trajectories and their scene features.
     @param slices_per_trajectory: Total slices produced per source trajectory.

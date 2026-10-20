@@ -579,7 +579,11 @@ def get_args():
     parser.add_argument("--randomize-scene", action="store_true")
 
     parser.add_argument("--model", type=str, default="")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
 
     # later also add randomization options - with seed
 
@@ -590,7 +594,16 @@ def get_args():
 def main() -> None:
     args = get_args()
 
-    gs.init(backend=gs.gpu)  # pyright: ignore
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested, but no CUDA device is available.")
+
+    genesis_backend = gs.cpu if device.type == "cpu" else gs.gpu
+    gs.init(backend=genesis_backend)
+    if device.type == "cuda" and gs.backend == gs.cpu:
+        raise RuntimeError(
+            "GPU backend was requested, but Genesis initialized its CPU backend."
+        )
 
     # Load model
 
@@ -600,8 +613,8 @@ def main() -> None:
         model = DummyWorldModel()
     else:
         print('loading ', args.model)
-        checkpoint = torch.load(args.model, map_location=args.device)
-        model = _load_checkpoint_model(checkpoint, args.device)
+        checkpoint = torch.load(args.model, map_location=device)
+        model = _load_checkpoint_model(checkpoint, device)
 
     # Create world
 

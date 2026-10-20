@@ -60,37 +60,6 @@ def _build_mlp(
     return nn.Sequential(*layers)
 
 
-def _build_mlp2(
-    input_size: int,
-    output_size: int,
-    *,
-    layer_norm_enabled: bool,
-    final_weight_gain: float,
-) -> nn.Sequential:
-    """Build the dynamics MLP with three optionally normalized hidden layers.
-
-    @param input_size: Number of input values per sample.
-    @param output_size: Number of output values per sample.
-    @param layer_norm_enabled: Whether to normalize each hidden linear output.
-    @param final_weight_gain: Xavier gain for the dynamics output weights.
-
-    @return: Sequential linear network mapping input_size to output_size.
-    """
-
-    hidden_size = 16
-    layers = []
-    hidden_input_size = input_size
-    for _ in range(3):
-        layers.append(nn.Linear(hidden_input_size, hidden_size))
-        if layer_norm_enabled:
-            layers.append(nn.LayerNorm(hidden_size))
-        layers.append(nn.ReLU())
-        hidden_input_size = hidden_size
-    layers.append(nn.Linear(hidden_size, output_size))
-    _initialize_mlp(layers, final_weight_gain)
-    return nn.Sequential(*layers)
-
-
 class ObservationEncoder(nn.Module):
     """Distill raw coordinate observations for latent-state updates.
 
@@ -166,7 +135,7 @@ class LatentStateModel(nn.Module):
     stores a row's current state.
 
     @param latent_size: L, the persistent latent width.
-    @param hidden_size: Width of the state-update and decoder hidden layers.
+    @param hidden_size: Width of every learned component's hidden layers.
     @param warm_up_length: Number of observed frames before autonomous prediction.
     @param layer_norm_enabled: Whether hidden MLP layers use LayerNorm.
     @param dynamics_output_weight_gain: Initial Xavier gain for the residual output.
@@ -208,9 +177,10 @@ class LatentStateModel(nn.Module):
             layer_norm_enabled=layer_norm_enabled,
             final_weight_gain=None,
         )
-        self.dynamics_model = _build_mlp2(
+        self.dynamics_model = _build_mlp(
             latent_size,
             latent_size,
+            hidden_size,
             layer_norm_enabled=layer_norm_enabled,
             final_weight_gain=dynamics_output_weight_gain,
         )

@@ -346,7 +346,7 @@ class LatentStateTest(unittest.TestCase):
 
         expected_hidden_layer_counts = {
             model.state_updater: 2,
-            model.dynamics_model: 3,
+            model.dynamics_model: 2,
             model.latent_state_decoder: 2,
         }
         for network, hidden_layer_count in expected_hidden_layer_counts.items():
