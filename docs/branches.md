@@ -19,7 +19,7 @@ scene-world relation, creating an extensible inheritance scheme and adds a new c
 This branch demonstrates learning to infer acceleration in a generalized way, with randomization of scenes preventing the model from memorizing specific trajectories (as occurred in 1.0) 
 
 <p align="center">
-  <img src="../artifacts/eval3-zoomed.png" width="50%" alt="Model rollout evaluation"><img src="../artifacts/acceleration.png" width="50%" alt="Acceleration learning graph"><br>
+  <img src="images/eval3-zoomed.png" width="50%" alt="Model rollout evaluation"><img src="images/acceleration.png" width="50%" alt="Acceleration learning graph"><br>
   <span style="display: inline-block; width: 50%; margin-left: 50%;"><small><em>Acceleration averaged across three axes.  Spikes indicate surface transfers and are out of scope for this model.</em></small></span>
 </p>
 
