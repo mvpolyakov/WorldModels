@@ -5,7 +5,7 @@ GRI is a personal learning project, experimenting with **world models for roboti
 The first phase aims to train a recurrent object world model for physical interaction using the [Genesis](https://github.com/Genesis-Embodied-AI/genesis-world) physics engine.  The repo contains an interactive scene editor and command-line tools for training and evaluating a model in simulated environments. The current milestone (v1.1) successfully predicts ball motion in randomized ramp environments:
 
 <p align="center">
-  <img src="docs/images/eval2-zoomed.png" style="width: calc(50% - 40px); margin: 20px;" alt="Model evaluation visualization 2"><img src="docs/images/eval3-zoomed.png" style="width: calc(50% - 40px); margin: 20px;" alt="Model evaluation visualization 3"><br>
+  <img src="docs/images/eval2-zoomed.png" width="48%" alt="Model evaluation visualization 2"><img src="docs/images/eval3-zoomed.png" width="48%" alt="Model evaluation visualization 3"><br>
   <small>Blue path traces actual ball in simulation, orange traces blind roll-out prediction, yellow marks warm up observation period. Trajectories typically remain visually identical for a hundred or more steps (Pictured trajectories are ~1000 steps). </small>
 </p>
 
