@@ -1,6 +1,6 @@
-# General Robotic Intelligence
+# World Models (in Simulation)
 
-GRI is a personal learning project, experimenting with **world models for robotics**, starting with learning physical dynamics in simulation.
+This is a personal learning project, experimenting with **world models for robotics**, starting with learning physical dynamics in simulation.
 
 The first phase aims to train a recurrent object world model for physical interaction using the [Genesis](https://github.com/Genesis-Embodied-AI/genesis-world) physics engine.  The repo contains an interactive scene editor and command-line tools for training and evaluating a model in simulated environments. The current milestone (v1.1) successfully predicts ball motion in randomized ramp environments:
 
