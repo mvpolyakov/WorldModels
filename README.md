@@ -28,7 +28,7 @@ Install by cloning the repo and installing `requirements.txt`. Linux and WSL are
 
 To run only evaluation on the CPU, install the smaller [requirements-eval-cpu.txt](requirements-eval-cpu.txt) environment instead. The evaluation script automatically selects its CPU backend when the installed PyTorch build has no CUDA support.
 
-Run the eval script to watch a pre-trained model predict motion on a random scene: 
+Check out the latest frozen branch and run the eval script to watch a pre-trained model predict motion on a random scene: 
 
 <code>python src/eval.py --randomize-scene --steps 800 --model artifacts/phase1.1.checkpoint.tar</code>
 
